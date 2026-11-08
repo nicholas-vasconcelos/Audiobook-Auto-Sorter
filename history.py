@@ -117,6 +117,14 @@ class History:
                               [*args, per_page, (max(page, 1) - 1) * per_page]).fetchall()
         return [dict(r) for r in rows], total
 
+    def sorted_books(self) -> list[dict]:
+        """The latest 'sorted' event for each library folder."""
+        with self._db() as db:
+            rows = db.execute("""SELECT * FROM events e WHERE kind = 'sorted'
+                                 AND id = (SELECT MAX(id) FROM events WHERE kind = 'sorted' AND dest = e.dest)
+                                 ORDER BY ts""").fetchall()
+        return [dict(r) for r in rows]
+
     def quarantined(self, limit: int = 200) -> list[dict]:
         with self._db() as db:
             rows = db.execute("SELECT * FROM events WHERE kind = 'quarantined' ORDER BY ts DESC LIMIT ?",

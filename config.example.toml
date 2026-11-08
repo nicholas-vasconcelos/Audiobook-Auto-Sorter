@@ -56,6 +56,12 @@ clamd_host = "clamav"
 clamd_port = 3310
 
 
+[metadata]
+# Files written into each book folder so Audiobookshelf shows Audible's details (README).
+write_opf = true          # metadata.opf: title, author, narrator, series, description, genres, ASIN
+download_cover = true     # Audible's cover as cover.jpg when the folder has no cover image
+asin_in_folder = false    # name folders "Title [ASIN]"
+
 [web]
 enabled = true
 port = 8090

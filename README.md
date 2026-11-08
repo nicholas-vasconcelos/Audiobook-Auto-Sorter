@@ -78,6 +78,41 @@ Otherwise the sorter copies the files and logs a warning.
    - correct the tags or rename the folder;
    - move it from the review folder into the inbox, and it is sorted again.
 
+## Ready for Audiobookshelf: metadata.opf and cover.jpg
+Each book folder the sorter files also gets:
+
+- **`metadata.opf`** with Audible's details: title, subtitle, author(s), narrator(s), series
+  and book number, description, publisher, release date, language, genres and the ASIN.
+  Audiobookshelf trusts an OPF file over the audio tags, so it shows these details instead of
+  whatever the download was tagged with. No "Match" needed.
+- **`cover.jpg`**, Audible's cover (1024 px), unless the folder already has a `cover` or
+  `folder` image.
+
+Books you file from the review page get them too. **Accept match** uses Audible's details;
+**Edit and sort** writes what you typed (no cover, since there's no Audible match).
+
+The audio files are never changed. For torrents they're hard links to the files being seeded,
+and editing them would break seeding.
+
+Options, under `[metadata]` in `config.toml`:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `write_opf` | `true` | Write `metadata.opf`. |
+| `download_cover` | `true` | Download Audible's cover when the folder has none. |
+| `asin_in_folder` | `false` | Name folders `Title [B08G9PRS1K]`. Audiobookshelf reads an ASIN in brackets, which helps its own Match. |
+
+**Books sorted before this feature.** Add the files to books the sorter already filed (it uses
+the history database):
+```bash
+docker exec audiobook-sorter python /app/audiobook_sorter.py --config /config/config.toml --write-metadata
+```
+Books that already show in Audiobookshelf may keep their old details: its own saved metadata
+outranks the OPF. Use the book's **Match**, or remove and re-scan the book.
+
+**Audiobookshelf settings.** In the library's settings, keep **OPF** above **audio file tags**
+in the metadata order of precedence (it is by default).
+
 ---
 
 ## Web page

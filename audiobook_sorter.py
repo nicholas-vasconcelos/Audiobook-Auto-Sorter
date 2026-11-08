@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import logging.handlers
@@ -27,6 +28,7 @@ import tomllib
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from xml.sax.saxutils import escape, quoteattr
 
 import mutagen
 import requests
@@ -81,6 +83,13 @@ class ScanSettings:
 
 
 @dataclass
+class MetadataSettings:
+    write_opf: bool = True          # metadata.opf next to each book (Audiobookshelf prefers it to the tags)
+    download_cover: bool = True     # Audible's cover as cover.jpg, unless the folder already has a cover
+    asin_in_folder: bool = False    # "Project Hail Mary [B08G9PRS1K]": lets Audiobookshelf match by ASIN
+
+
+@dataclass
 class WebSettings:
     host: str = "0.0.0.0"
     port: int = 8090
@@ -101,6 +110,7 @@ class Config:
     qbit: QbitSettings | None = None
     scan: ScanSettings = field(default_factory=ScanSettings)
     web: WebSettings | None = None
+    metadata: MetadataSettings = field(default_factory=MetadataSettings)
 
 
 def load_config(path: Path) -> Config:
@@ -138,6 +148,10 @@ def load_config(path: Path) -> Config:
         clamd_host=s.get("clamd_host", ""),
         clamd_port=int(s.get("clamd_port", 3310)),
     )
+    md = raw.get("metadata", {})
+    cfg.metadata = MetadataSettings(write_opf=bool(md.get("write_opf", True)),
+                                    download_cover=bool(md.get("download_cover", True)),
+                                    asin_in_folder=bool(md.get("asin_in_folder", False)))
     if (w := raw.get("web")) is not None and w.get("enabled", True):
         cfg.web = WebSettings(host=w.get("host", "0.0.0.0"), port=int(w.get("port", 8090)),
                               password=os.environ.get("SORTER_UI_PASSWORD") or w.get("password", ""))
@@ -292,6 +306,7 @@ class Meta:
     author_candidates: list[str] = field(default_factory=list)  # tag author, then filename/folder author
     seq_hint: str = ""   # a leading number like "1 Double-Blind": only used to break ties
     asin: str = ""       # Audible product id, for a match / closest candidate
+    product: dict | None = field(default=None, repr=False)  # the full Audible record (for metadata.opf)
 
     def __str__(self):
         s = f"author={self.author!r} title={self.title!r}"
@@ -509,10 +524,15 @@ class Verdict:
     candidate: Meta | None = None  # closest Audible match when it failed (offered on the review page)
 
 
+# Title, authors, narrators, series, description, publisher, date, language, genres and cover.
+AUDIBLE_GROUPS = ("contributors,series,product_desc,product_attrs,product_extended_attrs,media,"
+                  "category_ladders")
+
+
 def audible_search(cfg: Config, params: dict) -> list[dict]:
     url = f"https://api.audible.{cfg.audible_region}/1.0/catalog/products"
     params = {"num_results": 10, "products_sort_by": "Relevance",
-              "response_groups": "contributors,series,product_desc,product_attrs", **params}
+              "response_groups": AUDIBLE_GROUPS, "image_sizes": "500,1024", **params}
     for attempt in range(3):
         try:
             r = requests.get(url, params=params, timeout=20)
@@ -609,7 +629,8 @@ def judge(cfg: Config, tag: Meta, author: str, title_q: str, products: list[dict
         seq = clean_sequence(seq)
 
     meta = Meta(author=a_name, title=clean_title(p.get("title") or tag.title) or tag.title,
-                series=series, sequence=seq, narrator=tag.narrator, source="audible", asin=p.get("asin", ""))
+                series=series, sequence=seq, narrator=tag.narrator, source="audible", asin=p.get("asin", ""),
+                product=p)
     return Verdict(True, meta=meta, reason=cand)
 
 
@@ -623,7 +644,7 @@ def candidate_meta(p: dict, author: str = "", tag: Meta | None = None) -> Meta:
         author = next((n for n in names if n), "")
     title = p.get("title") or ""
     return Meta(author=author, title=clean_title(title) or title, series=series, sequence=clean_sequence(seq),
-                narrator=tag.narrator if tag else "", source="audible", asin=p.get("asin", ""))
+                narrator=tag.narrator if tag else "", source="audible", asin=p.get("asin", ""), product=p)
 
 
 ASIN_RE = re.compile(r"\basin ([A-Z0-9]{10})\b")
@@ -635,7 +656,7 @@ def audible_product(cfg: Config, asin: str) -> dict | None:
         return None
     url = f"https://api.audible.{cfg.audible_region}/1.0/catalog/products/{asin}"
     try:
-        r = requests.get(url, params={"response_groups": "contributors,series,product_desc,product_attrs"},
+        r = requests.get(url, params={"response_groups": AUDIBLE_GROUPS, "image_sizes": "500,1024"},
                          timeout=20)
         r.raise_for_status()
         return r.json().get("product") or None
@@ -681,8 +702,140 @@ def destination(cfg: Config, m: Meta) -> Path:
         title = strip_series_prefix(title, m.series)
         if m.sequence:
             title = f"{format_sequence(m.sequence)} - {title}"
-    parts.append(safe_part(title))
+    folder = safe_part(title)
+    if cfg.metadata.asin_in_folder and re.fullmatch(r"[A-Z0-9]{10}", m.asin or ""):
+        folder += f" [{m.asin}]"
+    parts.append(folder)
     return cfg.library_dir.joinpath(*parts)
+
+
+# --------------------------------------------------------------------------- metadata for Audiobookshelf
+
+COVER_NAMES = {"cover", "folder"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+MAX_COVER_BYTES = 15_000_000
+
+
+def html_to_text(s: str) -> str:
+    """Audible's HTML description -> plain paragraphs."""
+    s = re.sub(r"(?i)<br\s*/?>|</p>|</li>", "\n", s or "")
+    s = html.unescape(re.sub(r"<[^>]+>", "", s))
+    lines = [" ".join(line.split()) for line in s.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def genres(p: dict) -> list[str]:
+    out = []
+    for ladder in p.get("category_ladders") or []:
+        for step in ladder.get("ladder") or []:
+            name = (step.get("name") or "").strip()
+            if name and name not in out:
+                out.append(name)
+    return out[:10]
+
+
+def opf_xml(m: Meta, p: dict | None) -> str:
+    """An OPF file in the layout Audiobookshelf's docs show (Calibre style)."""
+    p = p or {}
+    authors = [m.author] + [n for a in p.get("authors") or []
+                            if (n := dedupe_name(a.get("name", ""))) and n != m.author]
+    narrators = [n for x in p.get("narrators") or [] if (n := (x.get("name") or "").strip())]
+    if not narrators and m.narrator:
+        narrators = [m.narrator]
+    rows = [f"<dc:title>{escape(m.title)}</dc:title>"]
+    if p.get("subtitle"):
+        rows.append(f"<dc:subtitle>{escape(p['subtitle'])}</dc:subtitle>")
+    rows += [f'<dc:creator opf:role="aut">{escape(a)}</dc:creator>' for a in authors if a]
+    rows += [f'<dc:creator opf:role="nrt">{escape(n)}</dc:creator>' for n in narrators]
+    if p.get("publisher_name"):
+        rows.append(f"<dc:publisher>{escape(p['publisher_name'])}</dc:publisher>")
+    if date := (p.get("release_date") or p.get("issue_date") or ""):
+        rows.append(f"<dc:date>{escape(date)}</dc:date>")
+    if p.get("language"):
+        rows.append(f"<dc:language>{escape(p['language'])}</dc:language>")
+    if desc := html_to_text(p.get("publisher_summary") or p.get("merchandising_summary") or ""):
+        rows.append(f"<dc:description>{escape(desc)}</dc:description>")
+    rows += [f"<dc:subject>{escape(g)}</dc:subject>" for g in genres(p)]
+    if asin := (m.asin or p.get("asin") or ""):
+        rows.append(f'<dc:identifier opf:scheme="ASIN">{escape(asin)}</dc:identifier>')
+    if m.series:
+        rows.append(f'<meta name="calibre:series" content={quoteattr(m.series)}/>')
+        if m.sequence:
+            rows.append(f'<meta name="calibre:series_index" content={quoteattr(m.sequence)}/>')
+    body = "\n    ".join(rows)
+    return ('<?xml version="1.0" encoding="utf-8"?>\n'
+            '<package xmlns="http://www.idpf.org/2007/opf" version="2.0">\n'
+            '  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">\n'
+            f"    {body}\n  </metadata>\n</package>\n")
+
+
+def has_cover(folder: Path) -> bool:
+    return any(f.is_file() and f.stem.lower() in COVER_NAMES and f.suffix.lower() in IMAGE_EXTS
+               for f in folder.iterdir())
+
+
+def download_cover(p: dict, target: Path) -> bool:
+    images = p.get("product_images") or {}
+    url = images.get("1024") or images.get("500") or next(iter(images.values()), "")
+    if not url.startswith("https://"):
+        return False
+    try:
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        data = r.content
+    except requests.RequestException as e:
+        log.warning("Couldn't download the cover from Audible: %s", e)
+        return False
+    if len(data) > MAX_COVER_BYTES or not data.startswith(b"\xff\xd8"):  # must be a JPEG
+        log.warning("Audible's cover for %s isn't a usable JPEG; skipped", p.get("asin"))
+        return False
+    tmp = target.with_name(target.name + ".sorting")
+    tmp.write_bytes(data)
+    os.replace(tmp, target)
+    return True
+
+
+def write_book_metadata(cfg: Config, dest: Path, m: Meta) -> None:
+    """Put metadata.opf (and Audible's cover) in the book folder, so Audiobookshelf shows the Audible
+    details instead of whatever the download's tags say. The audio files themselves are never changed:
+    for a torrent they're hard links to the files being seeded."""
+    md = cfg.metadata
+    if cfg.dry_run or not (md.write_opf or md.download_cover) or not dest.is_dir():
+        return
+    p = m.product
+    if p is None and m.asin:
+        try:
+            p = audible_product(cfg, m.asin)
+        except NetworkError as e:
+            log.warning("No Audible details for %s (%s); writing what's known", dest.name, e)
+    try:
+        if md.write_opf:
+            tmp = dest / "metadata.opf.sorting"
+            tmp.write_text(opf_xml(m, p), encoding="utf-8")
+            os.replace(tmp, dest / "metadata.opf")
+        if md.download_cover and p and not has_cover(dest):
+            download_cover(p, dest / "cover.jpg")
+    except OSError as e:
+        log.warning("Couldn't write metadata for %s: %s", dest, e)
+
+
+def backfill_metadata(cfg: Config) -> None:
+    """--write-metadata: add metadata.opf / cover.jpg to books this sorter filed before it wrote them."""
+    if _history is None:
+        sys.exit("--write-metadata needs the history database (a [web] or [qbittorrent] section).")
+    done = skipped = 0
+    for r in _history.sorted_books():
+        dest = Path(r["dest"])
+        if not dest.is_dir() or (dest / "metadata.opf").exists():
+            skipped += 1
+            continue
+        match = ASIN_RE.search(r.get("reason") or "")
+        m = Meta(author=r["author"], title=r["title"], series=r["series"], sequence=r["sequence"],
+                 asin=match.group(1) if match else "")
+        write_book_metadata(cfg, dest, m)
+        log.info("METADATA %s", dest)
+        done += 1
+    log.info("Wrote metadata for %d book(s); %d skipped (already done or folder gone)", done, skipped)
 
 
 def label(cfg: Config, book: Book) -> str:
@@ -1000,6 +1153,8 @@ def process(cfg: Config, book: Book, mode: str = "move", torrent_hash: str = "")
         raise RetryLater(f"library_dir not reachable: {cfg.library_dir}")
     if mode == "link" and already_placed(book, dest):
         log.info("Already in the library: %s -> %s", label(cfg, book), dest)
+        if not (dest / "metadata.opf").exists():
+            write_book_metadata(cfg, dest, m)
         return "sorted"
     if dest.exists() and any(p.suffix.lower() in cfg.audio_extensions for p in dest.rglob("*")):
         return send_to_review(cfg, book, f"duplicate: {dest} already has audio files", tag, mode, torrent_hash)
@@ -1021,6 +1176,7 @@ def process(cfg: Config, book: Book, mode: str = "move", torrent_hash: str = "")
         raise RetryLater(f"{mode} failed: {e}")
     if _history is not None and mode == "link":
         _history.add_placements(torrent_hash, pairs)
+    write_book_metadata(cfg, dest, m)
     log.info("%s %s -> %s", "LINKED" if mode == "link" else "MOVED", label(cfg, book), dest)
     remember("sorted", label(cfg, book), torrent_hash=torrent_hash, author=m.author, series=m.series,
              sequence=m.sequence, title=m.title, dest=str(dest), reason=verdict.reason, tags=str(tag),
@@ -1176,6 +1332,7 @@ class ReviewActions:
                 _history.move_placements(r["torrent_hash"], pairs)
         finally:
             WORK_LOCK.release()
+        write_book_metadata(cfg, dest, m)
         log.info("SORTED from review %s -> %s (%s)", r["name"], dest, reason)
         remember("sorted", r["name"], torrent_hash=r.get("torrent_hash", ""), author=m.author, series=m.series,
                  sequence=m.sequence, title=m.title, dest=str(dest), reason=reason, tags=r.get("tags", ""),
@@ -1652,6 +1809,8 @@ def main() -> None:
     ap.add_argument("--once", action="store_true", help="process current files (no settle wait) and exit")
     ap.add_argument("--dry-run", action="store_true", help="log decisions without moving anything")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--write-metadata", action="store_true",
+                    help="add metadata.opf / cover.jpg to books sorted earlier, then exit")
     args = ap.parse_args()
 
     setup_logging(args.verbose)
@@ -1668,6 +1827,9 @@ def main() -> None:
     if cfg.web or cfg.qbit:
         _history = History(DATA_DIR / "sorter.db", readonly=cfg.dry_run)
     log.info("Source %s -> library %s%s", cfg.source_dir, cfg.library_dir, "  [DRY RUN]" if cfg.dry_run else "")
+    if args.write_metadata:  # one-off job next to the running sorter: no web page, no sorting
+        backfill_metadata(cfg)
+        return
     if cfg.web and not args.once:
         import webui
         webui.start(_history, STATUS, cfg, None if cfg.dry_run else ReviewActions(cfg))
