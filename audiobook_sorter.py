@@ -1216,25 +1216,41 @@ def torrent_root(cfg: Config, t: dict) -> Path:
     return local_path(cfg, t.get("content_path") or str(Path(t["save_path"]) / name))
 
 
-def without_blocked(cfg: Config, books: list[Book]) -> list[Book]:
-    """Leave out the files the type filter blocks (a book allowed from quarantine takes only safe files)."""
-    ok = tuple(cfg.audio_extensions) + tuple(cfg.scan.allowed_extensions)
+def item_files(path: Path) -> list[Path]:
+    """Every file of a quarantined item (a folder, or one file)."""
+    if path.is_file():
+        return [path]
+    return sorted((p for p in path.rglob("*") if p.is_file()), key=natural_key)
+
+
+def item_rel(path: Path, p: Path) -> str:
+    """How a file of an item is named on the page: its path inside the item's folder."""
+    return p.name if path.is_file() else p.relative_to(path).as_posix()
+
+
+def only_files(books: list[Book], keep: set[Path]) -> list[Book]:
+    """Keep only the files you ticked; books left with no audio are dropped."""
+    out = []
     for b in books:
-        b.files = [p for p in b.files if p.suffix.lower() in ok]
-    return books
+        b.files = [p for p in b.files if p in keep]
+        b.audio = [p for p in b.audio if p in keep]
+        if b.audio:
+            out.append(b)
+    return out
 
 
-def sort_download(cfg: Config, qbit: Qbit, h: str, name: str, root: Path, allowed: bool = False) -> list[str]:
+def sort_download(cfg: Config, qbit: Qbit, h: str, name: str, root: Path,
+                  keep: set[Path] | None = None) -> list[str]:
     """Link a finished, checked download into the library (or review) and tag the torrent.
 
-    allowed: you let it out of quarantine, so files the type filter blocks are left behind.
+    keep: the files you let out of quarantine; the rest stay behind in the download.
     """
     if root.is_file():
         books = [Book(root, [root], [root])] if root.suffix.lower() in cfg.audio_extensions else []
     else:
         books = books_in_folder(cfg, root)
-    if allowed:
-        books = without_blocked(cfg, books)
+    if keep is not None:
+        books = only_files(books, keep)
     if not books:
         log.warning("REVIEW %s (no audio files in this torrent)", name)
         if not cfg.dry_run:
@@ -1367,15 +1383,40 @@ class ReviewActions:
         return f"Rejected {r['name']} and deleted its files."
 
     # ---------------------------------------------------------------- quarantine buttons
-    def allow(self, event_id: int) -> str:
-        """Let a quarantined book through: sort it as if the check had passed."""
+    def item_files(self, r: dict) -> list[tuple[str, int, bool]]:
+        """For the Allow form: (name inside the item, size, is audio) for each file still there."""
+        path = Path(r["dest"])
+        out = []
+        for p in item_files(path)[:self.MAX_LISTED]:
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            out.append((item_rel(path, p), size, p.suffix.lower() in self.cfg.audio_extensions))
+        return out
+
+    MAX_LISTED = 1000
+
+    def allow(self, event_id: int, chosen: list[str] | None = None) -> str:
+        """Let a quarantined book through: sort the files you ticked as if the check had passed.
+
+        chosen: names from the Allow form (None = every audio file).
+        """
         cfg = self.cfg
         r, path, t = self._quarantined(event_id)
+        files = item_files(path)
+        if chosen is None:
+            keep = {p for p in files if p.suffix.lower() in cfg.audio_extensions}
+        else:
+            wanted = set(chosen)
+            keep = {p for p in files if item_rel(path, p) in wanted}
+        if not any(p.suffix.lower() in cfg.audio_extensions for p in keep):
+            raise ActionError("Tick at least one audio file to allow.")
         self._acquire()
         try:
             if t is not None:  # torrent still in qBittorrent: link into the library, then seed again
                 try:
-                    outcomes = sort_download(cfg, self.qbit, t["hash"], r["name"], path, allowed=True)
+                    outcomes = sort_download(cfg, self.qbit, t["hash"], r["name"], path, keep=keep)
                     self.qbit.remove_tags(t["hash"], TAG_QUARANTINE)
                     self.qbit.start(t["hash"])
                 except RetryLater as e:
@@ -1387,7 +1428,7 @@ class ReviewActions:
                     books = [Book(path, [path], [path])] if path.suffix.lower() in cfg.audio_extensions else []
                 else:
                     books = books_in_folder(cfg, path)
-                books = without_blocked(cfg, books)
+                books = only_files(books, keep)
                 if not books:
                     raise ActionError("There are no audio files in it to sort.")
                 outcomes = []
@@ -1398,9 +1439,7 @@ class ReviewActions:
                     except RetryLater as e:
                         raise ActionError(f"Sorted {len(outcomes)} of {len(books)} so far; the rest failed "
                                           f"({e}). Press Allow again in a minute.")
-                if path.is_dir() and not any(p.suffix.lower() in cfg.audio_extensions
-                                             for p in path.rglob("*") if p.is_file()):
-                    _remove_tree(path)  # only the blocked extras are left
+                _remove_tree(path)  # what's left is what you didn't tick
         finally:
             WORK_LOCK.release()
         remember("allowed", r["name"], torrent_hash=r.get("torrent_hash", ""), dest=r["dest"],

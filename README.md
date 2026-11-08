@@ -147,7 +147,7 @@ With a password set, each quarantined item waiting for you has two buttons:
 | Button | What it does |
 |---|---|
 | **Delete files** | Asks once more, then permanently deletes the files. For a torrent, only that torrent's own files go; the torrent stays in qBittorrent's list, stopped and tagged `quarantine`, for you to remove there. |
-| **Allow** | Sorts the book as if the check had passed: Audible match, then the library (with `metadata.opf` and cover) or Needs review. Blocked files (the `.exe`, `.epub`, …) are left out. A torrent is hard-linked and starts seeding again, then is removed at its seed limit like any other. If ClamAV reported a virus, you must tick a box first. |
+| **Allow** | Lists every file with a tick box: audio files (`.mp3`, `.m4b`, …) are ticked, everything else isn't, and the files that caused the block are marked. Tick or untick what you want, then the ticked files are sorted as if the check had passed: Audible match, then the library (with `metadata.opf` and cover) or Needs review. A torrent is hard-linked and starts seeding again; unticked files stay only in the download and go when the torrent is removed at its seed limit. For a book in the quarantine folder, unticked files are deleted. If ClamAV reported a virus, you must tick a box first. |
 
 Inbox books are moved into `torrents/quarantine`, and Allow moves them on from there. Items
 quarantined by an older version (moved into that folder and removed from qBittorrent) work

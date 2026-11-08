@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, quote, urlparse
 
 log = logging.getLogger("audiobook_sorter")
 PER_PAGE = 50
-MAX_FORM = 16_384
+MAX_FORM = 262_144   # the Allow form lists every file of a quarantined item
 
 CSS = """
 :root{--bg:#f6f5f2;--card:#fff;--text:#1d1c1a;--muted:#6b6862;--line:#e3e0da;--accent:#2f6f5e;
@@ -93,6 +93,11 @@ color:var(--text);font:inherit;font-size:14px;min-width:0}
 .flash.ok{background:var(--chip);border-left:4px solid var(--ok)}
 .flash.err{background:var(--bad-bg);border-left:4px solid var(--bad)}
 .note{font-size:13px;color:var(--muted);margin-top:10px}
+.files{max-height:320px;overflow:auto;margin:0 0 10px;padding:6px 10px;border:1px solid var(--line);
+border-radius:8px;background:var(--card)}
+.files label{display:flex;gap:8px;align-items:baseline;padding:3px 0;font-size:13.5px;word-break:break-all}
+.files label span{margin-left:auto;padding-left:12px;color:var(--muted);white-space:nowrap}
+.files label.blocked{color:var(--bad)}
 @media (max-width:700px){.hide-sm{display:none}.status{margin-left:0}}
 """
 
@@ -217,7 +222,8 @@ class Handler(BaseHTTPRequestHandler):
         if not 0 < length <= MAX_FORM:
             self.send(400, "Bad request", "text/plain")
             return
-        form = {k: v[0] for k, v in parse_qs(self.rfile.read(length).decode("utf-8", "replace")).items()}
+        raw = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+        form = {k: v[0] for k, v in raw.items()}
         if not hmac.compare_digest(form.get("csrf", ""), self.csrf):
             self.send(403, "Refused: the page was out of date. Reload it and try again.", "text/plain")
             return
@@ -236,7 +242,7 @@ class Handler(BaseHTTPRequestHandler):
             elif do == "reject":
                 ok, text = True, self.actions.reject(event_id)
             elif do == "allow":
-                ok, text = True, self.actions.allow(event_id)
+                ok, text = True, self.actions.allow(event_id, raw.get("file", []))
             elif do == "discard":
                 ok, text = True, self.actions.discard(event_id)
             else:
@@ -354,6 +360,18 @@ class Handler(BaseHTTPRequestHandler):
                    f'<button class="danger" name="do" value="reject">Delete it</button></form></div></details>')
         return will + '<div class="actions">' + "".join(out) + "</div>"
 
+    def file_picker(self, r: dict) -> str:
+        """Checkboxes for each file of a quarantined item; audio ticked, everything else not."""
+        blocked = r["reason"] or ""
+        rows = []
+        for name, n, audio in self.actions.item_files(r):
+            base = Path(name).name
+            flag = f"{base} (" in blocked or f"{base}:" in blocked   # named in the block reason
+            rows.append(f'<label class="{"blocked" if flag else ""}"><input type="checkbox" name="file" '
+                        f'value="{esc(name)}"{" checked" if audio else ""}>{esc(name)}'
+                        f'<span>{"blocked · " if flag else ""}{esc(size(n))}</span></label>')
+        return f'<div class="files">{"".join(rows)}</div>'
+
     def history_page(self, query: str, page: int) -> str:
         rows, total = self.history.history(query, page, PER_PAGE)
         head = "<h1>Sorted</h1><p class='sub'>Books placed in the library, newest first.</p>"
@@ -431,13 +449,13 @@ class Handler(BaseHTTPRequestHandler):
         torrent = self.actions.quarantine_state(r) == "torrent"
         virus = "virus found" in (r["reason"] or "")
         if torrent:
-            allow_text = ("Links the audio into the library (or Needs review if Audible has no match), "
-                          "then starts the torrent seeding again.")
+            allow_text = ("Links the ticked files into the library (or Needs review if Audible has no match), "
+                          "then starts the torrent seeding again. Unticked files stay in the download only.")
             delete_text = (f"Permanently deletes this torrent's {r['files']} files ({esc(size(r['size']))}). "
                            "The torrent stays in qBittorrent's list, stopped. This can't be undone.")
         else:
-            allow_text = ("Moves the audio into the library (or Needs review if Audible has no match). "
-                          "Blocked extras left behind are deleted.")
+            allow_text = ("Moves the ticked files into the library (or Needs review if Audible has no match). "
+                          "Unticked files are deleted.")
             delete_text = (f"Permanently deletes these {r['files']} files ({esc(size(r['size']))}) from the "
                            "quarantine folder. This can't be undone.")
         confirm = ('<label class="note" style="display:block;margin:0 0 10px">'
@@ -448,7 +466,7 @@ class Handler(BaseHTTPRequestHandler):
                 f'<form method="post" action="/review/action">{hidden}'
                 f'<button class="danger" name="do" value="discard">Delete files</button></form></div></details>'
                 f'<details><summary>Allow</summary><div class="panel"><p>{allow_text}</p>'
-                f'<form method="post" action="/review/action">{hidden}{confirm}'
+                f'<form method="post" action="/review/action">{hidden}{self.file_picker(r)}{confirm}'
                 f'<button class="primary" name="do" value="allow">Allow and sort</button></form></div></details>'
                 '</div>')
 
