@@ -34,7 +34,7 @@ dry_run = false
 # (so they keep seeding) and removed once they reach qBittorrent's share limit.
 # Delete this section to only use source_dir.
 [qbittorrent]
-url = "http://qbittorrent:8080"
+url = "http://qbittorrent:8081"
 # Leave username/password empty if qBittorrent lets the container subnet in without a login
 # (Options > Web UI > "Bypass authentication for clients in whitelisted IP subnets": 172.30.50.0/24).
 username = ""

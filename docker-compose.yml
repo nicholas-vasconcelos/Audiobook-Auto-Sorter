@@ -21,15 +21,15 @@ services:
       - PGID=100
       - UMASK=022            # files readable by ClamAV and the sorter
       - TZ=Europe/London
-      - WEBUI_PORT=8080
+      - WEBUI_PORT=8081      # QTS itself uses 8080
       - TORRENTING_PORT=6881
     volumes:
       - /share/Container/qbittorrent:/config
       - /share/Container/torrents:/data/torrents
     ports:
-      # Web UI on NAS port 8081 (QTS itself uses 8080). Inside the network it stays 8080,
-      # which is what the sorter uses. LAN / Tailscale only, never forward this on the router.
-      - "8081:8080"
+      # Web UI. Both numbers must equal WEBUI_PORT, or qBittorrent answers "Unauthorized".
+      # LAN / Tailscale only, never forward this on the router.
+      - "8081:8081"
       - "6881:6881"
       - "6881:6881/udp"
     security_opt:

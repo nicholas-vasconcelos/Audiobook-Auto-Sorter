@@ -153,8 +153,10 @@ It starts three containers:
 | `audiobook-sorter` | 8090 | Runs as the `media` user with a read-only filesystem and no extra privileges. |
 
 If creation fails with `address already in use`, another app on the NAS has that port.
-Change the left-hand number of that port in `docker-compose.yml` (e.g. `8082:8080`), delete
-the half-created application in Container Station, and create it again.
+Pick another port in `docker-compose.yml`, delete the half-created application in Container
+Station, and create it again. For qBittorrent's Web UI change all three together: `WEBUI_PORT`,
+both sides of the port mapping (e.g. `8082:8082`), and `url` in `config.toml`. If the two sides
+differ, qBittorrent's page just says "Unauthorized".
 
 #### Fix "Permission denied"
 The sorter runs as the UID/GID in `docker-compose.yml` (`user:`), and it must be able to write
