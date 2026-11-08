@@ -10,7 +10,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY,
     ts REAL NOT NULL,
-    kind TEXT NOT NULL,            -- sorted | review | quarantined | removed
+    kind TEXT NOT NULL,            -- sorted | review | quarantined | removed | rejected
     name TEXT NOT NULL,            -- torrent / book name as shown in the log
     torrent_hash TEXT DEFAULT '',
     author TEXT DEFAULT '', series TEXT DEFAULT '', sequence TEXT DEFAULT '', title TEXT DEFAULT '',
@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS events (
     reason TEXT DEFAULT '',        -- why (review/quarantine) or the Audible match (sorted)
     tags TEXT DEFAULT '',          -- what the tags said
     files INTEGER DEFAULT 0,
-    size INTEGER DEFAULT 0
+    size INTEGER DEFAULT 0,
+    candidate TEXT DEFAULT ''      -- review: closest Audible match as JSON (offered by "Accept match")
 );
 CREATE INDEX IF NOT EXISTS events_kind ON events(kind, ts);
 CREATE INDEX IF NOT EXISTS events_hash ON events(torrent_hash);
@@ -38,6 +39,9 @@ class History:
         with self._db() as db:
             db.execute("PRAGMA journal_mode=WAL")
             db.executescript(SCHEMA)
+            cols = {r["name"] for r in db.execute("PRAGMA table_info(events)")}
+            if "candidate" not in cols:  # database from an earlier version
+                db.execute("ALTER TABLE events ADD COLUMN candidate TEXT DEFAULT ''")
 
     def _db(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=10)
@@ -60,7 +64,28 @@ class History:
             db.executemany("INSERT INTO placements VALUES (?, ?, ?)",
                            [(torrent_hash, str(s), str(d)) for s, d in pairs])
 
+    def move_placements(self, torrent_hash: str, moves) -> None:
+        """Files placed for a torrent were moved (review -> library): follow them."""
+        if self.readonly or not torrent_hash:
+            return
+        with self.lock, self._db() as db:
+            db.executemany("UPDATE placements SET dst = ? WHERE torrent_hash = ? AND dst = ?",
+                           [(str(new), torrent_hash, str(old)) for old, new in moves])
+
     # ------------------------------------------------------------------ reading
+    def event(self, event_id: int) -> dict | None:
+        with self._db() as db:
+            r = db.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        return dict(r) if r else None
+
+    def rejected(self, torrent_hash: str) -> bool:
+        """You rejected this torrent's review copy: it may be deleted without checking a library copy."""
+        if not torrent_hash:
+            return False
+        with self._db() as db:
+            return db.execute("SELECT 1 FROM events WHERE kind = 'rejected' AND torrent_hash = ? LIMIT 1",
+                              (torrent_hash,)).fetchone() is not None
+
     def placements(self, torrent_hash: str) -> list[tuple[str, str]]:
         with self._db() as db:
             rows = db.execute("SELECT src, dst FROM placements WHERE torrent_hash = ?", (torrent_hash,))

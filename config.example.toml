@@ -59,5 +59,6 @@ clamd_port = 3310
 [web]
 enabled = true
 port = 8090
-# Optional login for the page (any user name). Or set the SORTER_UI_PASSWORD environment variable.
+# Login for the page (any user name). Needed for the Accept / Edit / Reject buttons on review
+# items; without it the page is read-only. Or set the SORTER_UI_PASSWORD environment variable.
 password = ""

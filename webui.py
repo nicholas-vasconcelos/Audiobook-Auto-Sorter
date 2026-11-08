@@ -1,6 +1,8 @@
-"""Read-only web page for the sorter: books under review, sorted history, and quarantine.
+"""Web page for the sorter: books under review (with decision buttons), sorted history, and quarantine.
 
 Runs in a background thread inside the sorter (Python's built-in http.server, no framework).
+The buttons only work when a password is set; every form carries a secret token so that no
+other website can press them for you.
 """
 from __future__ import annotations
 
@@ -8,6 +10,7 @@ import base64
 import hmac
 import html
 import logging
+import secrets
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,6 +19,7 @@ from urllib.parse import parse_qs, quote, urlparse
 
 log = logging.getLogger("audiobook_sorter")
 PER_PAGE = 50
+MAX_FORM = 16_384
 
 CSS = """
 :root{--bg:#f6f5f2;--card:#fff;--text:#1d1c1a;--muted:#6b6862;--line:#e3e0da;--accent:#2f6f5e;
@@ -64,6 +68,31 @@ form.search button,.pager a{padding:8px 14px;border:1px solid var(--line);border
 background:var(--card);color:var(--text);font:inherit;text-decoration:none;cursor:pointer}
 .pager{display:flex;gap:8px;align-items:center;margin-top:16px;color:var(--muted)}
 .empty{color:var(--muted);text-align:center;padding:40px 16px}
+.actions{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start;margin-top:12px;padding-top:12px;
+border-top:1px solid var(--line)}
+.actions form{margin:0}
+.btn,.actions button,.actions summary{display:inline-block;padding:7px 14px;border:1px solid var(--line);
+border-radius:8px;background:var(--card);color:var(--text);font:inherit;font-size:14px;cursor:pointer;
+list-style:none;line-height:1.4}
+.actions summary::-webkit-details-marker{display:none}
+.btn.primary,.actions button.primary{background:var(--accent);border-color:var(--accent);color:var(--card);
+font-weight:600}
+.btn.danger,.actions button.danger,.actions summary.danger{color:var(--bad);border-color:var(--bad)}
+.actions details{flex-basis:auto}
+.actions details[open]{flex-basis:100%}
+.actions details[open] summary{background:var(--chip)}
+.panel{margin-top:8px;padding:12px;border-radius:8px;background:var(--chip)}
+.panel p{margin:0 0 10px;font-size:14px}
+.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:10px}
+.fields label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--muted)}
+.fields input{padding:7px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);
+color:var(--text);font:inherit;font-size:14px;min-width:0}
+.will{font-size:13px;color:var(--muted);margin-top:10px;word-break:break-word}
+.will b{color:var(--text);font-weight:550}
+.flash{border-radius:10px;padding:10px 14px;margin-bottom:16px;font-size:14px;word-break:break-word}
+.flash.ok{background:var(--chip);border-left:4px solid var(--ok)}
+.flash.err{background:var(--bad-bg);border-left:4px solid var(--bad)}
+.note{font-size:13px;color:var(--muted);margin-top:10px}
 @media (max-width:700px){.hide-sm{display:none}.status{margin-left:0}}
 """
 
@@ -103,6 +132,9 @@ class Handler(BaseHTTPRequestHandler):
     status: dict = {}
     cfg = None
     password = ""
+    actions = None          # ReviewActions; None = buttons off (dry run)
+    csrf = ""               # secret put in every form; a POST without it is refused
+    flash: dict = {}        # message id -> (ok, text), shown once after a decision
 
     def log_message(self, fmt, *args):  # keep the sorter's log clean
         pass
@@ -145,7 +177,8 @@ class Handler(BaseHTTPRequestHandler):
         q = {k: v[0] for k, v in parse_qs(url.query).items()}
         try:
             if url.path in ("/", "/review"):
-                self.send(200, self.page("review", self.review_page()))
+                msg = self.flash.pop(q.get("m", ""), None)
+                self.send(200, self.page("review", self.review_page(msg), refresh=not self.can_act()))
             elif url.path == "/history":
                 self.send(200, self.page("history", self.history_page(q.get("q", "").strip()[:100],
                                                                       int(q.get("page", "1") or 1))))
@@ -159,8 +192,66 @@ class Handler(BaseHTTPRequestHandler):
             log.exception("Web UI error")
             self.send(500, "Something went wrong; see audiobook_sorter.log", "text/plain")
 
+    def can_act(self) -> bool:
+        return bool(self.password) and self.actions is not None
+
+    def do_POST(self):
+        if not self.authorized():
+            self.send(401, "Login required", "text/plain", {"WWW-Authenticate": 'Basic realm="Audiobook sorter"'})
+            return
+        if urlparse(self.path).path != "/review/action":
+            self.send(404, "Not found", "text/plain")
+            return
+        if not self.can_act():
+            self.send(403, "Decisions need a password: set one under [web] in config.toml.", "text/plain")
+            return
+        origin = self.headers.get("Origin")
+        if origin and urlparse(origin).netloc.lower() != self.headers.get("Host", "").lower():
+            self.send(403, "Refused: request came from another site.", "text/plain")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if not 0 < length <= MAX_FORM:
+            self.send(400, "Bad request", "text/plain")
+            return
+        form = {k: v[0] for k, v in parse_qs(self.rfile.read(length).decode("utf-8", "replace")).items()}
+        if not hmac.compare_digest(form.get("csrf", ""), self.csrf):
+            self.send(403, "Refused: the page was out of date. Reload it and try again.", "text/plain")
+            return
+        try:
+            event_id = int(form.get("id", ""))
+        except ValueError:
+            self.send(400, "Bad request", "text/plain")
+            return
+        do = form.get("do", "")
+        try:
+            if do == "accept":
+                ok, text = True, self.actions.accept(event_id)
+            elif do == "sort":
+                ok, text = True, self.actions.sort_as(event_id, form.get("author", ""), form.get("series", ""),
+                                                      form.get("sequence", ""), form.get("title", ""))
+            elif do == "reject":
+                ok, text = True, self.actions.reject(event_id)
+            else:
+                self.send(400, "Bad request", "text/plain")
+                return
+        except Exception as e:
+            if type(e).__name__ != "ActionError":
+                log.exception("Review action failed")
+                text = "Something went wrong; see audiobook_sorter.log"
+            else:
+                text = str(e)
+            ok = False
+        key = secrets.token_urlsafe(8)
+        if len(self.flash) > 50:
+            self.flash.clear()
+        self.flash[key] = (ok, text)
+        self.send(303, "", "text/plain", {"Location": f"/?m={key}"})
+
     # ------------------------------------------------------------------ layout
-    def page(self, active: str, body: str) -> str:
+    def page(self, active: str, body: str, refresh: bool = True) -> str:
         counts = self.history.counts()
         n_review = len(self.history.pending_reviews())
         tabs = [("review", "/", "Needs review", n_review), ("history", "/history", "Sorted", counts.get("sorted", 0)),
@@ -168,7 +259,7 @@ class Handler(BaseHTTPRequestHandler):
         nav = "".join(f'<a href="{href}" class="{"on" if key == active else ""}">{esc(text)}'
                       f'<span class="n">{n}</span></a>' for key, href, text, n in tabs)
         return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="60">
+<meta name="viewport" content="width=device-width,initial-scale=1">{'<meta http-equiv="refresh" content="60">' if refresh else ''}
 <title>Audiobook Sorter</title><style>{CSS}</style></head><body>
 <header><div class="wrap top"><div class="brand">Audiobook Sorter</div><nav>{nav}</nav>
 <div class="status">{self.status_bar()}</div></div></header>
@@ -195,10 +286,15 @@ class Handler(BaseHTTPRequestHandler):
         return f'<span title="{esc(title)}"><span class="dot {cls}"></span>{esc(name)}</span>'
 
     # ------------------------------------------------------------------ pages
-    def review_page(self) -> str:
+    def review_page(self, msg=None) -> str:
         items = self.history.pending_reviews()
-        head = ("<h1>Needs review</h1><p class='sub'>No confident Audible match. Fix the tags or rename the "
-                "folder, then move it from the review folder into the inbox and it will be sorted again.</p>")
+        flash = f'<div class="flash {"ok" if msg[0] else "err"}">{esc(msg[1])}</div>' if msg else ""
+        if self.can_act():
+            sub = "No confident Audible match. Accept the closest match, enter the details yourself, or reject it."
+        else:
+            sub = ("No confident Audible match. Fix the tags or rename the folder, then move it from the review "
+                   "folder into the inbox and it will be sorted again.")
+        head = f"<h1>Needs review</h1><p class='sub'>{sub}</p>{flash}"
         if not items:
             return head + "<div class='card empty'>Nothing waiting for review.</div>"
         cards = []
@@ -209,8 +305,47 @@ class Handler(BaseHTTPRequestHandler):
             cards.append(f"""<div class="card warn"><h2>{esc(r['name'])}</h2>
 <ul class="reasons">{reasons(r['reason'])}</ul>
 <div class="meta">{('Tags: ' + tagged + '<br>') if tagged else ''}In <code>{esc(r['dest'])}</code><br>
-{esc(when(r['ts']))} · {r['files']} files · {esc(size(r['size']))}</div></div>""")
-        return head + "".join(cards)
+{esc(when(r['ts']))} · {r['files']} files · {esc(size(r['size']))}</div>{self.decisions(r)}</div>""")
+        note = ("" if self.can_act() or self.actions is None else
+                "<p class='note'>To decide here instead, set <code>password</code> under <code>[web]</code> "
+                "in config.toml and restart the sorter.</p>")
+        return head + "".join(cards) + note
+
+    def decisions(self, r: dict) -> str:
+        if not self.can_act():
+            return ""
+        a = self.actions
+        hidden = f'<input type="hidden" name="csrf" value="{esc(self.csrf)}"><input type="hidden" name="id" value="{r["id"]}">'
+        cand = a.candidate(r)
+        out = []
+        will = ""
+        if a.can_accept(r):
+            if cand:
+                will = f'<div class="will">Accept match files it as <b>{esc(a.preview(cand))}</b></div>'
+            out.append(f'<form method="post" action="/review/action">{hidden}'
+                       f'<button class="primary" name="do" value="accept">Accept match</button></form>')
+        pre = cand or r
+        fields = "".join(
+            f'<label>{label}<input name="{name}" value="{esc(pre.get(name, "") if isinstance(pre, dict) else getattr(pre, name))}"'
+            f'{extra}></label>'
+            for label, name, extra in (("Author", "author", ' required maxlength="200"'),
+                                       ("Series (optional)", "series", ' maxlength="200"'),
+                                       ("Book number", "sequence", ' inputmode="decimal" maxlength="7" '
+                                                                     'pattern="[0-9]{1,4}([.][0-9]{1,2})?"'),
+                                       ("Title", "title", ' required maxlength="200"')))
+        out.append(f'<details><summary>Edit and sort</summary><div class="panel">'
+                   f'<p>Filed as Author / Series / NN - Title, exactly as you type it.</p>'
+                   f'<form method="post" action="/review/action">{hidden}<div class="fields">{fields}</div>'
+                   f'<button class="primary" name="do" value="sort">Sort it</button></form></div></details>')
+        if a.is_torrent_copy(r):
+            warn = ("Deletes the copy in the review folder. The torrent keeps seeding until its limit, "
+                    "then it's removed together with its download.")
+        else:
+            warn = f"Permanently deletes these {r['files']} files ({esc(size(r['size']))}). This can't be undone."
+        out.append(f'<details><summary class="danger">Reject</summary><div class="panel"><p>{warn}</p>'
+                   f'<form method="post" action="/review/action">{hidden}'
+                   f'<button class="danger" name="do" value="reject">Delete it</button></form></div></details>')
+        return will + '<div class="actions">' + "".join(out) + "</div>"
 
     def history_page(self, query: str, page: int) -> str:
         rows, total = self.history.history(query, page, PER_PAGE)
@@ -251,9 +386,10 @@ class Handler(BaseHTTPRequestHandler):
         return head + "".join(cards)
 
 
-def start(history, status: dict, cfg) -> ThreadingHTTPServer:
+def start(history, status: dict, cfg, actions=None) -> ThreadingHTTPServer:
     handler = type("SorterHandler", (Handler,), {"history": history, "status": status, "cfg": cfg,
-                                                 "password": cfg.web.password})
+                                                 "password": cfg.web.password, "actions": actions,
+                                                 "csrf": secrets.token_urlsafe(32), "flash": {}})
     server = ThreadingHTTPServer((cfg.web.host, cfg.web.port), handler)
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, name="webui", daemon=True).start()

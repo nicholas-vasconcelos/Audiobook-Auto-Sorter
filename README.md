@@ -74,7 +74,7 @@ Otherwise the sorter copies the files and logs a warning.
 4. **Folder names.** They follow your library's style: `01 - Title`, with the series name
    taken off the front of the title.
 5. **Otherwise: review.** The book goes to review, and `review.log` (plus the web page) says
-   why. To fix it:
+   why. Decide on the web page (see below), or by hand:
    - correct the tags or rename the folder;
    - move it from the review folder into the inbox, and it is sorted again.
 
@@ -85,14 +85,30 @@ Otherwise the sorter copies the files and logs a warning.
 
 | Page | Shows |
 |---|---|
-| **Needs review** | Every book waiting for you, with the reasons it didn't match, what the tags said, the closest Audible match, and where the files are. An item disappears once you move it out of the review folder or it gets sorted. |
+| **Needs review** | Every book waiting for you, with the reasons it didn't match, what the tags said, the closest Audible match, and where the files are, plus buttons to decide (below). An item disappears once it is sorted, rejected or moved out of the review folder. |
 | **Sorted** | History, newest first, with search. It shows whether each torrent is still seeding or has been removed. |
 | **Quarantine** | What was blocked and why. |
 
 The header shows whether qBittorrent and ClamAV are reachable, and how recent the virus
-signatures are. The page is read-only. Set `password` under `[web]` (or the
-`SORTER_UI_PASSWORD` environment variable) to require a login. Only reach it over your LAN
-or Tailscale; never forward the port on your router.
+signatures are.
+
+### Deciding on review items
+With a password set, each review card has three buttons:
+
+| Button | What it does |
+|---|---|
+| **Accept match** | Files the book as the closest Audible match. The card shows the exact folder first, e.g. `Brandon Sanderson/The Stormlight Archive/05 - Wind and Truth`. Only shown when Audible had a candidate. |
+| **Edit and sort** | Opens a form (author, series, book number, title), pre-filled with the Audible candidate or the tags. The book is filed exactly as you type it. |
+| **Reject** | Asks once more, then deletes the review copy. For a torrent, only the review copy goes: the torrent seeds until its limit and is then removed with its download. For a book from the inbox it's the only copy, so it's gone for good; the page says so before you confirm. |
+
+Accepted and edited books move from the review folder into the library and show up on the
+Sorted page. A torrent keeps seeding from its download, and is removed at its seed limit as
+usual. If the destination already has audio, nothing moves and the page tells you why.
+
+**Security.** The buttons only appear when `password` is set under `[web]` (or the
+`SORTER_UI_PASSWORD` environment variable); without one the page stays read-only. Every form
+carries a secret token, and requests from other websites are refused. Only reach the page
+over your LAN or Tailscale; never forward the port on your router.
 
 ---
 

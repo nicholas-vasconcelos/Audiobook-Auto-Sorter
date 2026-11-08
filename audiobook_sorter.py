@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import logging.handlers
 import os
@@ -290,6 +291,7 @@ class Meta:
     title_variants: list[str] = field(default_factory=list)  # alternative titles to search with
     author_candidates: list[str] = field(default_factory=list)  # tag author, then filename/folder author
     seq_hint: str = ""   # a leading number like "1 Double-Blind": only used to break ties
+    asin: str = ""       # Audible product id, for a match / closest candidate
 
     def __str__(self):
         s = f"author={self.author!r} title={self.title!r}"
@@ -504,6 +506,7 @@ class Verdict:
     meta: Meta | None = None
     reason: str = ""
     final: bool = False  # don't bother trying other title variants
+    candidate: Meta | None = None  # closest Audible match when it failed (offered on the review page)
 
 
 def audible_search(cfg: Config, params: dict) -> list[dict]:
@@ -533,6 +536,7 @@ def verify_with_audible(cfg: Config, tag: Meta) -> Verdict:
     variants = tag.title_variants or [clean_title(tag.title)]
     authors = tag.author_candidates or [tag.author]
     reason = "no Audible results"
+    candidate = None
     for author in authors[:3]:
         for i, title_q in enumerate(variants[:4]):
             products = audible_search(cfg, {"title": title_q, "author": author})
@@ -544,7 +548,8 @@ def verify_with_audible(cfg: Config, tag: Meta) -> Verdict:
             if verdict.ok or verdict.final:
                 return verdict
             reason = verdict.reason
-    return Verdict(False, reason=reason)
+            candidate = verdict.candidate or candidate
+    return Verdict(False, reason=reason, candidate=candidate)
 
 
 def dedupe_name(name: str) -> str:
@@ -576,12 +581,13 @@ def judge(cfg: Config, tag: Meta, author: str, title_q: str, products: list[dict
             best = (rank, t_score, a_score, a_name, p, seqs)
 
     _, t_score, a_score, a_name, p, seqs = best
+    closest = candidate_meta(p, a_name, tag)
     cand = f"best Audible match: {p.get('title')!r} by {a_name!r} (title {t_score:.0f}, author {a_score:.0f}, asin {p.get('asin')})"
     if t_score < th or a_score < th:
-        return Verdict(False, reason=f"low match score for {title_q!r}; {cand}")
+        return Verdict(False, reason=f"low match score for {title_q!r}; {cand}", candidate=closest)
     if tag.seq_hint and seqs and tag.seq_hint not in seqs:
         return Verdict(False, reason=f"book number mismatch: expected #{tag.seq_hint}, Audible has "
-                                     f"#{', #'.join(sorted(seqs))}; {cand}")
+                                     f"#{', #'.join(sorted(seqs))}; {cand}", candidate=closest)
 
     series_list = [(s.get("title", ""), s.get("sequence", "")) for s in p.get("series") or []]
     series, seq = "", ""
@@ -592,7 +598,7 @@ def judge(cfg: Config, tag: Meta, author: str, title_q: str, products: list[dict
             if score < th:
                 return Verdict(False, final=True,
                                reason=f"series conflict: tags say {tag.series!r}, Audible says "
-                                      f"{[s[0] for s in series_list]}; {cand}")
+                                      f"{[s[0] for s in series_list]}; {cand}", candidate=closest)
         else:
             series = tag.series  # Audible has no series info; keep what the tags say
         seq = clean_sequence(seq) or tag.sequence
@@ -603,8 +609,38 @@ def judge(cfg: Config, tag: Meta, author: str, title_q: str, products: list[dict
         seq = clean_sequence(seq)
 
     meta = Meta(author=a_name, title=clean_title(p.get("title") or tag.title) or tag.title,
-                series=series, sequence=seq, narrator=tag.narrator, source="audible")
+                series=series, sequence=seq, narrator=tag.narrator, source="audible", asin=p.get("asin", ""))
     return Verdict(True, meta=meta, reason=cand)
+
+
+def candidate_meta(p: dict, author: str = "", tag: Meta | None = None) -> Meta:
+    """How an Audible product would be filed if you accept it on the review page."""
+    series_list = [(s.get("title", ""), s.get("sequence", "")) for s in p.get("series") or []]
+    with_seq = [s for s in series_list if s[1]]
+    series, seq = (with_seq or series_list or [("", "")])[0]
+    if not author:
+        names = [dedupe_name(a.get("name", "")) for a in p.get("authors") or []]
+        author = next((n for n in names if n), "")
+    title = p.get("title") or ""
+    return Meta(author=author, title=clean_title(title) or title, series=series, sequence=clean_sequence(seq),
+                narrator=tag.narrator if tag else "", source="audible", asin=p.get("asin", ""))
+
+
+ASIN_RE = re.compile(r"\basin ([A-Z0-9]{10})\b")
+
+
+def audible_product(cfg: Config, asin: str) -> dict | None:
+    """Look up one Audible product by its ASIN."""
+    if not re.fullmatch(r"[A-Z0-9]{10}", asin):
+        return None
+    url = f"https://api.audible.{cfg.audible_region}/1.0/catalog/products/{asin}"
+    try:
+        r = requests.get(url, params={"response_groups": "contributors,series,product_desc,product_attrs"},
+                         timeout=20)
+        r.raise_for_status()
+        return r.json().get("product") or None
+    except (requests.RequestException, ValueError) as e:
+        raise NetworkError(f"Audible lookup failed: {e}") from e
 
 
 # --------------------------------------------------------------------------- moving
@@ -866,7 +902,7 @@ _history: History | None = None
 
 
 def send_to_review(cfg: Config, book: Book, reason: str, tag: Meta | None,
-                   mode: str = "move", torrent_hash: str = "") -> str:
+                   mode: str = "move", torrent_hash: str = "", candidate: Meta | None = None) -> str:
     log.warning("REVIEW %s (%s)", label(cfg, book), reason)
     if cfg.dry_run:
         _report.append(Decision("review", label(cfg, book), reason=reason))
@@ -888,10 +924,17 @@ def send_to_review(cfg: Config, book: Book, reason: str, tag: Meta | None,
     remember("review", label(cfg, book), torrent_hash=torrent_hash, dest=str(target), reason=reason,
              tags=str(tag or ""), author=tag.author if tag else "", series=tag.series if tag else "",
              sequence=tag.sequence if tag else "", title=tag.title if tag else "",
-             files=len(book.files), size=size)
+             files=len(book.files), size=size, candidate=meta_json(candidate))
     if mode == "move":
         cleanup_leftovers(cfg, book.root)
     return "review"
+
+
+def meta_json(m: Meta | None) -> str:
+    if m is None or not (m.author and m.title):
+        return ""
+    return json.dumps({"author": m.author, "series": m.series, "sequence": m.sequence, "title": m.title,
+                       "asin": m.asin})
 
 
 def quarantine(cfg: Config, book: Book, reason: str, torrent_hash: str = "") -> None:
@@ -949,7 +992,7 @@ def process(cfg: Config, book: Book, mode: str = "move", torrent_hash: str = "")
         raise RetryLater(str(e))
 
     if not verdict.ok:
-        return send_to_review(cfg, book, verdict.reason, tag, mode, torrent_hash)
+        return send_to_review(cfg, book, verdict.reason, tag, mode, torrent_hash, verdict.candidate)
 
     m = verdict.meta
     dest = destination(cfg, m)
@@ -988,6 +1031,156 @@ def process(cfg: Config, book: Book, mode: str = "move", torrent_hash: str = "")
 
 
 _dry_run_dests: set[Path] = set()
+
+# The sorting loop and the web page's buttons both move files; only one of them works at a time.
+WORK_LOCK = threading.Lock()
+
+
+# --------------------------------------------------------------------------- review page decisions
+
+class ActionError(Exception):
+    """A decision on the review page couldn't be carried out; the message is shown to you."""
+
+
+def review_book(cfg: Config, path: Path) -> Book:
+    """The book sitting in a review folder (or a single file there)."""
+    if path.is_file():
+        return Book(root=path, audio=[path], files=[path])
+    files = sorted((p for p in path.rglob("*") if p.is_file()), key=natural_key)
+    return Book(root=path, audio=[p for p in files if p.suffix.lower() in cfg.audio_extensions], files=files)
+
+
+class ReviewActions:
+    """What the buttons on the review page do. Called from the web UI thread."""
+
+    MAX_FIELD = 200
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    # ---------------------------------------------------------------- shown on the page
+    def candidate(self, r: dict) -> Meta | None:
+        try:
+            c = json.loads(r.get("candidate") or "null")
+        except ValueError:
+            return None
+        if not c:
+            return None
+        return Meta(author=c.get("author", ""), title=c.get("title", ""), series=c.get("series", ""),
+                    sequence=c.get("sequence", ""), asin=c.get("asin", ""), source="audible")
+
+    def can_accept(self, r: dict) -> bool:
+        return self.candidate(r) is not None or bool(ASIN_RE.search(r.get("reason") or ""))
+
+    def preview(self, m: Meta) -> str:
+        """'Author/Series/03 - Title' as it would appear in the library."""
+        return destination(self.cfg, m).relative_to(self.cfg.library_dir).as_posix()
+
+    def is_torrent_copy(self, r: dict) -> bool:
+        return bool(r.get("torrent_hash"))
+
+    # ---------------------------------------------------------------- the buttons
+    def accept(self, event_id: int) -> str:
+        r, path = self._item(event_id)
+        m = self.candidate(r)
+        if m is None:
+            match = ASIN_RE.search(r.get("reason") or "")
+            if not match:
+                raise ActionError("There's no Audible match to accept for this book; use Edit and sort.")
+            try:
+                p = audible_product(self.cfg, match.group(1))
+            except NetworkError as e:
+                raise ActionError(f"Couldn't reach Audible ({e}). Try again in a minute.")
+            m = candidate_meta(p) if p else None
+            if not m or not (m.author and m.title):
+                raise ActionError("Audible no longer lists that book; use Edit and sort.")
+        return self._sort(r, path, m, f"accepted on the review page: Audible match {m.title!r} by {m.author!r}"
+                                      + (f" (asin {m.asin})" if m.asin else ""))
+
+    def sort_as(self, event_id: int, author: str, series: str, sequence: str, title: str) -> str:
+        author, series, sequence, title = (" ".join((v or "").split()) for v in (author, series, sequence, title))
+        if not author or not title:
+            raise ActionError("Author and title are both needed.")
+        if any(len(v) > self.MAX_FIELD for v in (author, series, title)):
+            raise ActionError(f"Keep each field under {self.MAX_FIELD} characters.")
+        if sequence and not re.fullmatch(r"\d{1,4}(?:\.\d{1,2})?", sequence):
+            raise ActionError("Book number must be a number, like 3 or 2.5.")
+        if sequence and not series:
+            raise ActionError("A book number needs a series name.")
+        r, path = self._item(event_id)
+        m = Meta(author=author, series=series, sequence=sequence, title=title, source="you")
+        return self._sort(r, path, m, "filed on the review page with the details you entered")
+
+    def reject(self, event_id: int) -> str:
+        r, path = self._item(event_id)
+        self._acquire()
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+        except OSError as e:
+            raise ActionError(f"Deleting the files failed: {e}")
+        finally:
+            WORK_LOCK.release()
+        log.info("REJECTED %s on the review page; deleted %s", r["name"], path)
+        remember("rejected", r["name"], torrent_hash=r.get("torrent_hash", ""), dest=str(path),
+                 reason="rejected on the review page", files=r.get("files", 0), size=r.get("size", 0))
+        if r.get("torrent_hash"):
+            return (f"Rejected {r['name']}. The review copy is deleted; the torrent seeds until its limit "
+                    f"and is then removed with its download.")
+        return f"Rejected {r['name']} and deleted its files."
+
+    # ---------------------------------------------------------------- helpers
+    @staticmethod
+    def _acquire() -> None:
+        if not WORK_LOCK.acquire(timeout=120):
+            raise ActionError("The sorter is busy (scanning or sorting). Try again in a minute.")
+
+    def _item(self, event_id: int) -> tuple[dict, Path]:
+        if self.cfg.dry_run or _history is None:
+            raise ActionError("Decisions are off during a dry run.")
+        r = _history.event(event_id)
+        if not r or r["kind"] != "review":
+            raise ActionError("That review item doesn't exist.")
+        path = Path(r["dest"])
+        try:
+            path.resolve().relative_to(self.cfg.review_dir.resolve())
+        except ValueError:
+            raise ActionError("That item isn't in the review folder.")
+        if path.resolve() == self.cfg.review_dir.resolve() or not path.exists():
+            raise ActionError("Its files are no longer in the review folder (already handled?).")
+        return r, path
+
+    def _sort(self, r: dict, path: Path, m: Meta, reason: str) -> str:
+        cfg = self.cfg
+        self._acquire()
+        try:
+            if not path.exists():
+                raise ActionError("Its files are no longer in the review folder (already handled?).")
+            book = review_book(cfg, path)
+            if not book.audio:
+                raise ActionError("There are no audio files left in it.")
+            dest = destination(cfg, m)
+            if not cfg.library_dir.exists():
+                raise ActionError(f"The library folder isn't reachable: {cfg.library_dir}")
+            if dest.exists() and any(p.suffix.lower() in cfg.audio_extensions for p in dest.rglob("*")):
+                raise ActionError(f"{dest.relative_to(cfg.library_dir).as_posix()} already has audio files. "
+                                  "Pick a different title or book number, or reject this copy.")
+            size = book_size(book)
+            try:
+                pairs = place_book(cfg, book, dest, "move")
+            except OSError as e:
+                raise ActionError(f"Moving the files failed: {e}")
+            if r.get("torrent_hash") and _history is not None:
+                _history.move_placements(r["torrent_hash"], pairs)
+        finally:
+            WORK_LOCK.release()
+        log.info("SORTED from review %s -> %s (%s)", r["name"], dest, reason)
+        remember("sorted", r["name"], torrent_hash=r.get("torrent_hash", ""), author=m.author, series=m.series,
+                 sequence=m.sequence, title=m.title, dest=str(dest), reason=reason, tags=r.get("tags", ""),
+                 files=len(book.files), size=size)
+        return f"Filed {r['name']} as {dest.relative_to(cfg.library_dir).as_posix()}"
 
 
 # --------------------------------------------------------------------------- dry-run report
@@ -1137,6 +1330,26 @@ def _tags(t: dict) -> set[str]:
     return {x.strip() for x in (t.get("tags") or "").split(",") if x.strip()}
 
 
+def copy_problem(src: str, dst: str) -> str:
+    """Why the library/review copy of one downloaded file can't be confirmed ('' = it's fine)."""
+    try:
+        if Path(dst).stat().st_size == Path(src).stat().st_size:
+            return ""
+        return f"{dst} has the wrong size"
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        return str(e)
+    # Not where it was put. If the download still has another hard link, the copy was moved
+    # (e.g. from review into the library by hand), so deleting the download loses nothing.
+    try:
+        if Path(src).stat().st_nlink > 1:
+            return ""
+        return f"missing {dst}"
+    except OSError as e:
+        return str(e)
+
+
 def limit_reached(t: dict, prefs: dict) -> bool:
     """Has this torrent hit its share limit (its own, or qBittorrent's global one)?"""
     ratio_limit = t.get("ratio_limit", -2)
@@ -1164,6 +1377,10 @@ class Sorter:
         self.next_seed_check = 0.0
 
     def scan(self) -> None:
+        with WORK_LOCK:
+            self._scan()
+
+    def _scan(self) -> None:
         now = time.time()
         STATUS["last_scan"] = now
         if self.qbit and now >= self.next_torrent_poll:
@@ -1350,18 +1567,11 @@ class Sorter:
                 continue  # stopped by hand, not by the share limit: leave it
             h, name = t["hash"], t.get("name", t["hash"])
             pairs = _history.placements(h) if _history is not None else []
-            if not pairs:
+            rejected = _history is not None and _history.rejected(h)
+            if not pairs and not rejected:
                 log.debug("Not removing %s: no record of where its files were placed", name)
                 continue
-            problems = []
-            for src, dst in pairs:
-                try:
-                    if Path(dst).stat().st_size != Path(src).stat().st_size:
-                        problems.append(f"{dst} has the wrong size")
-                except FileNotFoundError as e:
-                    problems.append(f"missing {e.filename}")
-                except OSError as e:
-                    problems.append(str(e))
+            problems = [] if rejected else [p for src, dst in pairs if (p := copy_problem(src, dst))]
             if problems:
                 log.warning("Not removing %s: library copy not confirmed (%s)", name, "; ".join(problems[:3]))
                 continue
@@ -1460,7 +1670,7 @@ def main() -> None:
     log.info("Source %s -> library %s%s", cfg.source_dir, cfg.library_dir, "  [DRY RUN]" if cfg.dry_run else "")
     if cfg.web and not args.once:
         import webui
-        webui.start(_history, STATUS, cfg)
+        webui.start(_history, STATUS, cfg, None if cfg.dry_run else ReviewActions(cfg))
         log.info("Web UI on http://%s:%d", "localhost" if cfg.web.host in ("0.0.0.0", "") else cfg.web.host,
                  cfg.web.port)
     Sorter(cfg, once=args.once, progress=report).run()
