@@ -1412,9 +1412,15 @@ class Sorter:
 
 def setup_logging(verbose: bool) -> None:
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s", "%Y-%m-%d %H:%M:%S")
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    fh = logging.handlers.RotatingFileHandler(DATA_DIR / "audiobook_sorter.log",
-                                              maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        fh = logging.handlers.RotatingFileHandler(DATA_DIR / "audiobook_sorter.log",
+                                                  maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    except PermissionError:
+        uid = f"{os.getuid()}:{os.getgid()}" if hasattr(os, "getuid") else "this user"
+        sys.exit(f"ERROR: can't write to {DATA_DIR}. The sorter runs as {uid}, which has no write "
+                 f"permission on that folder. On the NAS, make that user the owner of the folder "
+                 f"mounted at {DATA_DIR} (README: Run on QNAP -> Fix 'Permission denied').")
     fh.setFormatter(fmt)
     log.addHandler(fh)
     if sys.stdout is not None:  # pythonw has no console

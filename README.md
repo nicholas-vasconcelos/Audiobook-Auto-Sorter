@@ -156,8 +156,23 @@ If creation fails with `address already in use`, another app on the NAS has that
 Change the left-hand number of that port in `docker-compose.yml` (e.g. `8082:8080`), delete
 the half-created application in Container Station, and create it again.
 
-If the sorter logs `Permission denied` writing to the library, give the `media` user
-read/write on the `Container` share (QTS → Shared Folders → Edit permissions).
+#### Fix "Permission denied"
+The sorter runs as the UID/GID in `docker-compose.yml` (`user:`), and it must be able to write
+to `/config` (the log and history database), the torrents folders and the library. Folders
+made in File Station belong to your admin account, so it usually can't. Fix it over SSH:
+
+1. Check the numbers: `id media`. They must match `user:` and `PUID`/`PGID` in the compose
+   file. If they don't, edit the compose file and recreate the application.
+2. Make `media` the owner of the folders the sorter writes to:
+   ```bash
+   sudo chown -R media:everyone /share/Container/audiobook-sorter /share/Container/torrents /share/Container/audiobookshelf/audiobooks
+   ```
+   ```bash
+   sudo chmod -R u+rwX,g+rX /share/Container/audiobook-sorter /share/Container/torrents /share/Container/audiobookshelf/audiobooks
+   ```
+3. Restart the `audiobook-sorter` container.
+
+Audiobookshelf only needs to read the library, so it keeps working.
 
 ### 4. Set up qBittorrent (`http://QNAP-NV:8081`)
 The first login password is in the container's log.
