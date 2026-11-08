@@ -58,7 +58,7 @@ SCANNER_RETRY_SECONDS = 60   # clamd still loading its signatures, etc.
 TORRENT_POLL_SECONDS = 30    # how often qBittorrent is asked for finished torrents
 SEED_CHECK_SECONDS = 300     # how often finished-seeding torrents are looked for
 
-TAG_SORTED, TAG_REVIEW = "sorted", "review"
+TAG_SORTED, TAG_REVIEW, TAG_QUARANTINE = "sorted", "review", "quarantine"
 DONE_STATES = {"uploading", "stalledUP", "queuedUP", "forcedUP", "pausedUP", "stoppedUP"}
 STOPPED_STATES = {"pausedUP", "stoppedUP"}
 
@@ -1090,19 +1090,26 @@ def meta_json(m: Meta | None) -> str:
                        "asin": m.asin})
 
 
-def quarantine(cfg: Config, book: Book, reason: str, torrent_hash: str = "") -> None:
+def quarantine(cfg: Config, book: Book, reason: str, torrent_hash: str = "", in_place: bool = False) -> None:
+    """Keep a blocked book away from the library.
+
+    Inbox books are moved into quarantine_dir. A torrent (in_place) stays where qBittorrent put it,
+    stopped and tagged 'quarantine', so it stays in qBittorrent's list until you decide.
+    """
     (log.warning if cfg.dry_run else log.error)("QUARANTINE %s (%s)", label(cfg, book), reason)
     if cfg.dry_run:
         _report.append(Decision("quarantine", label(cfg, book), reason=reason))
         _dry_gone.update(book.files)
         return
     size = book_size(book)
-    target = move_aside(cfg, book, cfg.quarantine_dir)
+    target = book.root if in_place else move_aside(cfg, book, cfg.quarantine_dir)
+    cfg.quarantine_dir.mkdir(parents=True, exist_ok=True)
     with open(cfg.quarantine_dir / "quarantine.log", "a", encoding="utf-8") as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{target.name}\t{reason}\n")
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{target}\t{reason}\n")
     remember("quarantined", label(cfg, book), torrent_hash=torrent_hash, dest=str(target), reason=reason,
              files=len(book.files), size=size)
-    cleanup_leftovers(cfg, book.root)
+    if not in_place:
+        cleanup_leftovers(cfg, book.root)
 
 
 def security_check(cfg: Config, files: list[Path], scan_paths: list[Path]) -> str | None:
@@ -1192,6 +1199,77 @@ _dry_run_dests: set[Path] = set()
 WORK_LOCK = threading.Lock()
 
 
+# --------------------------------------------------------------------------- torrents
+
+def local_path(cfg: Config, p: str) -> Path:
+    """Translate a path as qBittorrent sees it into a path the sorter can open."""
+    for remote, local in cfg.qbit.path_map:
+        r = remote.rstrip("/\\")
+        if p == r or p.startswith(r + "/") or p.startswith(r + "\\"):
+            return Path(local + p[len(r):])
+    return Path(p)
+
+
+def torrent_root(cfg: Config, t: dict) -> Path:
+    """The torrent's download: its top folder, or its one file."""
+    name = t.get("name") or t["hash"]
+    return local_path(cfg, t.get("content_path") or str(Path(t["save_path"]) / name))
+
+
+def without_blocked(cfg: Config, books: list[Book]) -> list[Book]:
+    """Leave out the files the type filter blocks (a book allowed from quarantine takes only safe files)."""
+    ok = tuple(cfg.audio_extensions) + tuple(cfg.scan.allowed_extensions)
+    for b in books:
+        b.files = [p for p in b.files if p.suffix.lower() in ok]
+    return books
+
+
+def sort_download(cfg: Config, qbit: Qbit, h: str, name: str, root: Path, allowed: bool = False) -> list[str]:
+    """Link a finished, checked download into the library (or review) and tag the torrent.
+
+    allowed: you let it out of quarantine, so files the type filter blocks are left behind.
+    """
+    if root.is_file():
+        books = [Book(root, [root], [root])] if root.suffix.lower() in cfg.audio_extensions else []
+    else:
+        books = books_in_folder(cfg, root)
+    if allowed:
+        books = without_blocked(cfg, books)
+    if not books:
+        log.warning("REVIEW %s (no audio files in this torrent)", name)
+        if not cfg.dry_run:
+            remember("review", name, torrent_hash=h, dest=str(root), reason="no audio files in this torrent")
+            qbit.add_tags(h, TAG_REVIEW)
+        else:
+            _report.append(Decision("review", name, reason="no audio files in this torrent"))
+        return ["review"]
+    for b in books:
+        b.label = name if b.root == root else f"{name}/{b.root.relative_to(root).as_posix()}"
+    outcomes = [process(cfg, b, mode="link", torrent_hash=h) for b in books]
+    if not cfg.dry_run:
+        tag = TAG_SORTED if all(o == "sorted" for o in outcomes) else TAG_REVIEW
+        try:
+            qbit.add_tags(h, tag)
+        except QbitError as e:  # harmless: next time it's found to be already in place
+            log.warning("Couldn't tag %s as %r: %s", name, tag, e)
+    return outcomes
+
+
+def _remove_file(p: Path) -> None:
+    try:
+        p.unlink(missing_ok=True)
+    except PermissionError:  # read-only flag, common on torrent extras
+        os.chmod(p, 0o666)
+        p.unlink(missing_ok=True)
+
+
+def _remove_tree(p: Path) -> None:
+    if p.is_dir():
+        shutil.rmtree(p, onerror=lambda func, q, _e: (os.chmod(q, 0o777), func(q)))
+    elif p.exists() or p.is_symlink():
+        _remove_file(p)
+
+
 # --------------------------------------------------------------------------- review page decisions
 
 class ActionError(Exception):
@@ -1207,12 +1285,13 @@ def review_book(cfg: Config, path: Path) -> Book:
 
 
 class ReviewActions:
-    """What the buttons on the review page do. Called from the web UI thread."""
+    """What the buttons on the review and quarantine pages do. Called from the web UI thread."""
 
     MAX_FIELD = 200
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.qbit = Qbit(cfg.qbit.url, cfg.qbit.username, cfg.qbit.password) if cfg.qbit else None
 
     # ---------------------------------------------------------------- shown on the page
     def candidate(self, r: dict) -> Meta | None:
@@ -1287,7 +1366,139 @@ class ReviewActions:
                     f"and is then removed with its download.")
         return f"Rejected {r['name']} and deleted its files."
 
+    # ---------------------------------------------------------------- quarantine buttons
+    def allow(self, event_id: int) -> str:
+        """Let a quarantined book through: sort it as if the check had passed."""
+        cfg = self.cfg
+        r, path, t = self._quarantined(event_id)
+        self._acquire()
+        try:
+            if t is not None:  # torrent still in qBittorrent: link into the library, then seed again
+                try:
+                    outcomes = sort_download(cfg, self.qbit, t["hash"], r["name"], path, allowed=True)
+                    self.qbit.remove_tags(t["hash"], TAG_QUARANTINE)
+                    self.qbit.start(t["hash"])
+                except RetryLater as e:
+                    raise ActionError(f"Couldn't sort it yet ({e}). Try again in a minute.")
+                except QbitError as e:
+                    raise ActionError(f"qBittorrent: {e}")
+            else:  # files in the quarantine folder: move them into the library
+                if path.is_file():
+                    books = [Book(path, [path], [path])] if path.suffix.lower() in cfg.audio_extensions else []
+                else:
+                    books = books_in_folder(cfg, path)
+                books = without_blocked(cfg, books)
+                if not books:
+                    raise ActionError("There are no audio files in it to sort.")
+                outcomes = []
+                for b in books:
+                    b.label = r["name"] if b.root == path else f"{r['name']}/{b.root.relative_to(path).as_posix()}"
+                    try:
+                        outcomes.append(process(cfg, b, mode="move"))
+                    except RetryLater as e:
+                        raise ActionError(f"Sorted {len(outcomes)} of {len(books)} so far; the rest failed "
+                                          f"({e}). Press Allow again in a minute.")
+                if path.is_dir() and not any(p.suffix.lower() in cfg.audio_extensions
+                                             for p in path.rglob("*") if p.is_file()):
+                    _remove_tree(path)  # only the blocked extras are left
+        finally:
+            WORK_LOCK.release()
+        remember("allowed", r["name"], torrent_hash=r.get("torrent_hash", ""), dest=r["dest"],
+                 reason="allowed on the quarantine page", files=r.get("files", 0), size=r.get("size", 0))
+        log.warning("ALLOWED %s on the quarantine page (was: %s)", r["name"], r["reason"])
+        n_sorted = outcomes.count("sorted")
+        n_review = len(outcomes) - n_sorted
+        parts = []
+        if n_sorted:
+            parts.append(f"{n_sorted} book{'s' if n_sorted != 1 else ''} filed in the library")
+        if n_review:
+            parts.append(f"{n_review} sent to Needs review")
+        seeding = " The torrent is seeding again." if t is not None else ""
+        return f"Allowed {r['name']}: {' and '.join(parts)}.{seeding}"
+
+    def discard(self, event_id: int) -> str:
+        """Delete a quarantined book's files. A torrent stays in qBittorrent's list, stopped."""
+        cfg = self.cfg
+        r, path, t = self._quarantined(event_id)
+        self._acquire()
+        try:
+            if t is not None:
+                try:
+                    self.qbit.stop(t["hash"])
+                    names = self.qbit.files(t["hash"])
+                except QbitError as e:
+                    raise ActionError(f"qBittorrent: {e}")
+                save = local_path(cfg, t["save_path"]).resolve()
+                targets = []
+                for name in names:  # only the torrent's own files, never the rest of the folder
+                    p = (save / name).resolve()
+                    if p == save or save not in p.parents:
+                        raise ActionError(f"Refused: {name!r} points outside the download folder.")
+                    targets.append(p)
+                for p in targets:
+                    _remove_file(p)
+                for d in sorted({q for p in targets for q in p.parents if save in q.parents},
+                                key=lambda q: len(q.parts), reverse=True):
+                    try:
+                        d.rmdir()  # empty folders the torrent made
+                    except OSError:
+                        pass
+            else:
+                _remove_tree(path)
+        except OSError as e:
+            raise ActionError(f"Deleting the files failed: {e}")
+        finally:
+            WORK_LOCK.release()
+        remember("discarded", r["name"], torrent_hash=r.get("torrent_hash", ""), dest=r["dest"],
+                 reason="deleted on the quarantine page", files=r.get("files", 0), size=r.get("size", 0))
+        log.info("DELETED quarantined %s on the quarantine page", r["name"])
+        if t is not None:
+            return (f"Deleted the files of {r['name']}. The torrent is still in qBittorrent, stopped and tagged "
+                    f"'{TAG_QUARANTINE}'; remove it there when you like.")
+        return f"Deleted {r['name']} from the quarantine folder."
+
+    def quarantine_state(self, r: dict) -> str:
+        """For the page: 'torrent' (waiting, still in qBittorrent), 'folder' (waiting, in the quarantine
+        folder) or 'gone' (files no longer there)."""
+        path = Path(r["dest"])
+        if not r["dest"] or not path.exists():
+            return "gone"
+        try:
+            path.resolve().relative_to(self.cfg.quarantine_dir.resolve())
+            return "folder"
+        except ValueError:
+            return "torrent" if r.get("torrent_hash") else "gone"
+
     # ---------------------------------------------------------------- helpers
+    def _quarantined(self, event_id: int) -> tuple[dict, Path, dict | None]:
+        """The quarantined item, its files, and its qBittorrent torrent if it's still there."""
+        cfg = self.cfg
+        if cfg.dry_run or _history is None:
+            raise ActionError("Decisions are off during a dry run.")
+        r = _history.event(event_id)
+        if not r or r["kind"] != "quarantined":
+            raise ActionError("That quarantine item doesn't exist.")
+        if _history.quarantine_outcome(r):
+            raise ActionError("That one has already been handled.")
+        path = Path(r["dest"])
+        if not r["dest"] or not path.exists():
+            raise ActionError("Its files are no longer there (deleted by hand?).")
+        qdir = cfg.quarantine_dir.resolve()
+        if qdir in path.resolve().parents:
+            return r, path, None
+        h = r.get("torrent_hash") or ""
+        if not h or self.qbit is None:
+            raise ActionError("That item isn't in the quarantine folder.")
+        try:
+            t = self.qbit.torrent(h)
+        except QbitError as e:
+            raise ActionError(f"qBittorrent: {e}")
+        if t is None:
+            raise ActionError("That torrent is no longer in qBittorrent.")
+        if torrent_root(cfg, t).resolve() != path.resolve():
+            raise ActionError("The torrent's files have moved since it was quarantined.")
+        return r, path, t
+
     @staticmethod
     def _acquire() -> None:
         if not WORK_LOCK.acquire(timeout=120):
@@ -1442,7 +1653,7 @@ def print_report(cfg: Config) -> None:
                     w(f"{indent}  {s.dim('from ' + d.label)}")
     if quarantines:
         w("")
-        w(s.red(s.bold(f"QUARANTINE  {len(quarantines)}")) + s.dim(f"  (would go to {cfg.quarantine_dir})"))
+        w(s.red(s.bold(f"QUARANTINE  {len(quarantines)}")) + s.dim(f"  (inbox books to {cfg.quarantine_dir}; torrents stopped in qBittorrent)"))
         for d in quarantines:
             w("")
             w("  " + s.red("x ") + d.label)
@@ -1609,14 +1820,6 @@ class Sorter:
             _report.append(Decision("error", name, reason=str(e)))
 
     # ------------------------------------------------------------------ qBittorrent
-    def local_path(self, p: str) -> Path:
-        """Translate a path as qBittorrent sees it into a path the sorter can open."""
-        for remote, local in self.cfg.qbit.path_map:
-            r = remote.rstrip("/\\")
-            if p == r or p.startswith(r + "/") or p.startswith(r + "\\"):
-                return Path(local + p[len(r):])
-        return Path(p)
-
     def fetch_torrents(self) -> list[dict] | None:
         try:
             torrents = self.qbit.torrents(self.cfg.qbit.category)
@@ -1646,8 +1849,8 @@ class Sorter:
         now = time.time()
         for t in torrents:
             h = t.get("hash", "")
-            if _tags(t) & {TAG_SORTED, TAG_REVIEW}:
-                continue
+            if _tags(t) & {TAG_SORTED, TAG_REVIEW, TAG_QUARANTINE}:
+                continue  # done, or waiting for your decision on the Quarantine page
             if t.get("progress", 0) < 1 or t.get("state") not in DONE_STATES:
                 continue  # still downloading, checking or being moved out of the incomplete folder
             if self.retry_at.get(h, 0) > now or (self.cfg.dry_run and h in self.dry_done):
@@ -1665,7 +1868,7 @@ class Sorter:
 
     def handle_torrent(self, t: dict) -> None:
         cfg, h, name = self.cfg, t["hash"], t.get("name") or t["hash"]
-        root = self.local_path(t.get("content_path") or str(Path(t["save_path"]) / name))
+        root = torrent_root(cfg, t)
         if not root.exists():
             raise RetryLater(f"can't see the download at {root} (check [qbittorrent] path_map and mounts)")
         files = [root] if root.is_file() else sorted((p for p in root.rglob("*") if p.is_file()), key=natural_key)
@@ -1674,38 +1877,14 @@ class Sorter:
         reason = security_check(cfg, files, [root])
         if reason:
             if not cfg.dry_run:
-                try:  # stop seeding it and let go of the files before moving them
+                try:  # stop seeding it, but leave it in qBittorrent's list until you decide
                     self.qbit.stop(h)
-                    self.qbit.delete(h, delete_files=False)
+                    self.qbit.add_tags(h, TAG_QUARANTINE)
                 except QbitError as e:
-                    raise RetryLater(f"couldn't remove the torrent before quarantining it: {e}")
-            quarantine(cfg, whole, reason, torrent_hash=h)
+                    raise RetryLater(f"couldn't stop the torrent before quarantining it: {e}")
+            quarantine(cfg, whole, reason, torrent_hash=h, in_place=True)
             return
-
-        if root.is_file():
-            books = [Book(root, [root], [root])] if root.suffix.lower() in cfg.audio_extensions else []
-        else:
-            books = books_in_folder(cfg, root)
-        if not books:
-            log.warning("REVIEW %s (no audio files in this torrent)", name)
-            if not cfg.dry_run:
-                remember("review", name, torrent_hash=h, dest=str(root), reason="no audio files in this torrent")
-                self.qbit.add_tags(h, TAG_REVIEW)
-            else:
-                _report.append(Decision("review", name, reason="no audio files in this torrent"))
-            return
-        for b in books:
-            if b.root != root:
-                b.label = f"{name}/{b.root.relative_to(root).as_posix()}"
-            else:
-                b.label = name
-        outcomes = [process(cfg, b, mode="link", torrent_hash=h) for b in books]
-        if not cfg.dry_run:
-            tag = TAG_SORTED if all(o == "sorted" for o in outcomes) else TAG_REVIEW
-            try:
-                self.qbit.add_tags(h, tag)
-            except QbitError as e:  # harmless: next time it's found to be already in place
-                log.warning("Couldn't tag %s as %r: %s", name, tag, e)
+        sort_download(cfg, self.qbit, h, name, root)
 
     def cleanup_seeded(self) -> None:
         """Delete torrents that reached their seed limit, once their library copy is confirmed."""

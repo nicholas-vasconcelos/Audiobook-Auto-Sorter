@@ -25,8 +25,9 @@ also still runs on Windows on its own.
    files to `torrents/audiobooks`.
 2. **File-type filter.** Only audio, covers, `.cue`, `.nfo`, `.txt`, `.pdf`, playlists and
    checksums are allowed. If the torrent has anything else (`.exe`, `.zip`, `.lnk`, …), or
-   an "mp3" that is really a program, the whole torrent goes to `torrents/quarantine` and is
-   removed from qBittorrent.
+   an "mp3" that is really a program, the whole torrent is quarantined: it stays in
+   qBittorrent's list, stopped and tagged `quarantine`, with its files where they downloaded,
+   until you delete or allow it on the Quarantine page.
 3. **ClamAV.** Same outcome if a virus is found. If ClamAV can't be reached, the torrent
    waits; nothing unscanned is ever moved.
 4. **Metadata.** Tags are checked against Audible (see below).
@@ -122,7 +123,7 @@ in the metadata order of precedence (it is by default).
 |---|---|
 | **Needs review** | Every book waiting for you, with the reasons it didn't match, what the tags said, the closest Audible match, and where the files are, plus buttons to decide (below). An item disappears once it is sorted, rejected or moved out of the review folder. |
 | **Sorted** | History, newest first, with search. It shows whether each torrent is still seeding or has been removed. |
-| **Quarantine** | What was blocked and why. |
+| **Quarantine** | What was blocked and why, with buttons to delete or allow it (below). |
 
 The header shows whether qBittorrent and ClamAV are reachable, and how recent the virus
 signatures are.
@@ -139,6 +140,18 @@ With a password set, each review card has three buttons:
 Accepted and edited books move from the review folder into the library and show up on the
 Sorted page. A torrent keeps seeding from its download, and is removed at its seed limit as
 usual. If the destination already has audio, nothing moves and the page tells you why.
+
+### Deciding on quarantined items
+With a password set, each quarantined item waiting for you has two buttons:
+
+| Button | What it does |
+|---|---|
+| **Delete files** | Asks once more, then permanently deletes the files. For a torrent, only that torrent's own files go; the torrent stays in qBittorrent's list, stopped and tagged `quarantine`, for you to remove there. |
+| **Allow** | Sorts the book as if the check had passed: Audible match, then the library (with `metadata.opf` and cover) or Needs review. Blocked files (the `.exe`, `.epub`, …) are left out. A torrent is hard-linked and starts seeding again, then is removed at its seed limit like any other. If ClamAV reported a virus, you must tick a box first. |
+
+Inbox books are moved into `torrents/quarantine`, and Allow moves them on from there. Items
+quarantined by an older version (moved into that folder and removed from qBittorrent) work
+the same way. Handled items stay listed under **Handled**.
 
 **Security.** The buttons only appear when `password` is set under `[web]` (or the
 `SORTER_UI_PASSWORD` environment variable); without one the page stays read-only. Every form
@@ -278,7 +291,7 @@ Clicking a magnet link then queues it on the NAS straight into the audiobooks ca
 2. **Virus scan test.** Put the
    [EICAR test file](https://www.eicar.org/download-anti-malware-testfile/) in
    `torrents/inbox/test/`. It's a harmless string every antivirus flags. Within a minute it
-   should land in `torrents/quarantine`, and show on the Quarantine page.
+   should land in `torrents/quarantine`, and show on the Quarantine page. Delete it there.
 3. **Torrent test.** Add a free public-domain LibriVox torrent with a low ratio limit
    (right-click → Limit share ratio → 0.1). It should:
    - appear in the library and Audiobookshelf;

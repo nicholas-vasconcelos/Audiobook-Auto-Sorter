@@ -65,6 +65,6 @@ asin_in_folder = false    # name folders "Title [ASIN]"
 [web]
 enabled = true
 port = 8090
-# Login for the page (any user name). Needed for the Accept / Edit / Reject buttons on review
-# items; without it the page is read-only. Or set the SORTER_UI_PASSWORD environment variable.
+# Login for the page (any user name). Needed for the buttons on the review and quarantine
+# pages; without it the page is read-only. Or set the SORTER_UI_PASSWORD environment variable.
 password = ""

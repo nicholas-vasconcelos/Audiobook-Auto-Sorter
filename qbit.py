@@ -60,14 +60,34 @@ class Qbit:
         r = self._ok(self._req("GET", "torrents/info", params={"category": category}), "torrent list")
         return r.json()
 
+    def torrent(self, h: str) -> dict | None:
+        """One torrent by hash, whatever its category (None if it's not in qBittorrent)."""
+        r = self._ok(self._req("GET", "torrents/info", params={"hashes": h}), "torrent info")
+        found = [t for t in r.json() if t.get("hash", "").lower() == h.lower()]
+        return found[0] if found else None
+
+    def files(self, h: str) -> list[str]:
+        """The torrent's file names, relative to its save path."""
+        r = self._ok(self._req("GET", "torrents/files", params={"hash": h}), "torrent files")
+        return [f["name"] for f in r.json()]
+
     def add_tags(self, h: str, tags: str) -> None:
         self._ok(self._req("POST", "torrents/addTags", data={"hashes": h, "tags": tags}), "add tags")
+
+    def remove_tags(self, h: str, tags: str) -> None:
+        self._ok(self._req("POST", "torrents/removeTags", data={"hashes": h, "tags": tags}), "remove tags")
 
     def stop(self, h: str) -> None:
         r = self._req("POST", "torrents/stop", data={"hashes": h})       # v5
         if r.status_code == 404:
             r = self._req("POST", "torrents/pause", data={"hashes": h})  # v4
         self._ok(r, "stop torrent")
+
+    def start(self, h: str) -> None:
+        r = self._req("POST", "torrents/start", data={"hashes": h})      # v5
+        if r.status_code == 404:
+            r = self._req("POST", "torrents/resume", data={"hashes": h})  # v4
+        self._ok(r, "start torrent")
 
     def delete(self, h: str, delete_files: bool) -> None:
         data = {"hashes": h, "deleteFiles": "true" if delete_files else "false"}

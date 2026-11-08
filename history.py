@@ -10,7 +10,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY,
     ts REAL NOT NULL,
-    kind TEXT NOT NULL,            -- sorted | review | quarantined | removed | rejected
+    kind TEXT NOT NULL,            -- sorted | review | quarantined | removed | rejected | allowed | discarded
     name TEXT NOT NULL,            -- torrent / book name as shown in the log
     torrent_hash TEXT DEFAULT '',
     author TEXT DEFAULT '', series TEXT DEFAULT '', sequence TEXT DEFAULT '', title TEXT DEFAULT '',
@@ -125,11 +125,20 @@ class History:
                                  ORDER BY ts""").fetchall()
         return [dict(r) for r in rows]
 
+    OUTCOME = """(SELECT o.kind FROM events o WHERE o.kind IN ('allowed', 'discarded')
+                  AND o.dest = e.dest AND o.id > e.id ORDER BY o.id DESC LIMIT 1)"""
+
     def quarantined(self, limit: int = 200) -> list[dict]:
+        """Quarantine events, newest first, each with 'outcome': 'allowed', 'discarded' or None (waiting)."""
         with self._db() as db:
-            rows = db.execute("SELECT * FROM events WHERE kind = 'quarantined' ORDER BY ts DESC LIMIT ?",
-                              (limit,)).fetchall()
+            rows = db.execute(f"SELECT e.*, {self.OUTCOME} AS outcome FROM events e "
+                              "WHERE e.kind = 'quarantined' ORDER BY e.ts DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
+
+    def quarantine_outcome(self, event: dict) -> str | None:
+        with self._db() as db:
+            r = db.execute(f"SELECT {self.OUTCOME} FROM events e WHERE e.id = ?", (event["id"],)).fetchone()
+        return r[0] if r else None
 
     def counts(self) -> dict[str, int]:
         with self._db() as db:

@@ -183,7 +183,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(200, self.page("history", self.history_page(q.get("q", "").strip()[:100],
                                                                       int(q.get("page", "1") or 1))))
             elif url.path == "/quarantine":
-                self.send(200, self.page("quarantine", self.quarantine_page()))
+                msg = self.flash.pop(q.get("m", ""), None)
+                self.send(200, self.page("quarantine", self.quarantine_page(msg), refresh=not self.can_act()))
             else:
                 self.send(404, "Not found", "text/plain")
         except ValueError:
@@ -234,6 +235,10 @@ class Handler(BaseHTTPRequestHandler):
                                                       form.get("sequence", ""), form.get("title", ""))
             elif do == "reject":
                 ok, text = True, self.actions.reject(event_id)
+            elif do == "allow":
+                ok, text = True, self.actions.allow(event_id)
+            elif do == "discard":
+                ok, text = True, self.actions.discard(event_id)
             else:
                 self.send(400, "Bad request", "text/plain")
                 return
@@ -248,14 +253,16 @@ class Handler(BaseHTTPRequestHandler):
         if len(self.flash) > 50:
             self.flash.clear()
         self.flash[key] = (ok, text)
-        self.send(303, "", "text/plain", {"Location": f"/?m={key}"})
+        back = "/quarantine" if do in ("allow", "discard") else "/"
+        self.send(303, "", "text/plain", {"Location": f"{back}?m={key}"})
 
     # ------------------------------------------------------------------ layout
     def page(self, active: str, body: str, refresh: bool = True) -> str:
         counts = self.history.counts()
         n_review = len(self.history.pending_reviews())
+        n_quarantine = sum(1 for r in self.history.quarantined() if self.waiting(r))
         tabs = [("review", "/", "Needs review", n_review), ("history", "/history", "Sorted", counts.get("sorted", 0)),
-                ("quarantine", "/quarantine", "Quarantine", counts.get("quarantined", 0))]
+                ("quarantine", "/quarantine", "Quarantine", n_quarantine)]
         nav = "".join(f'<a href="{href}" class="{"on" if key == active else ""}">{esc(text)}'
                       f'<span class="n">{n}</span></a>' for key, href, text, n in tabs)
         return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -374,16 +381,76 @@ class Handler(BaseHTTPRequestHandler):
         return (head + form + "<table><thead><tr><th>Book</th><th class='hide-sm'>Library folder</th>"
                 "<th>Sorted</th><th></th></tr></thead><tbody>" + "".join(trs) + "</tbody></table>" + pager)
 
-    def quarantine_page(self) -> str:
+    @staticmethod
+    def waiting(r: dict) -> bool:
+        """A quarantined item nobody has decided on, whose files are still there."""
+        return not r.get("outcome") and bool(r["dest"]) and Path(r["dest"]).exists()
+
+    def quarantine_page(self, msg=None) -> str:
         items = self.history.quarantined()
-        head = ("<h1>Quarantine</h1><p class='sub'>Blocked by the file-type filter or ClamAV. These never reached "
-                "the library. Delete them from the quarantine folder once you've looked.</p>")
+        flash = f'<div class="flash {"ok" if msg[0] else "err"}">{esc(msg[1])}</div>' if msg else ""
+        if self.can_act():
+            sub = ("Blocked by the file-type filter or ClamAV; nothing here has reached the library. Delete the "
+                   "files, or allow a book you trust and it's sorted like any other.")
+        else:
+            sub = ("Blocked by the file-type filter or ClamAV; nothing here has reached the library. Set a "
+                   "password under [web] in config.toml to delete or allow them from this page.")
+        head = f"<h1>Quarantine</h1><p class='sub'>{sub}</p>{flash}"
         if not items:
             return head + "<div class='card empty'>Nothing has been quarantined.</div>"
-        cards = [f"""<div class="card bad"><h2>{esc(r['name'])}</h2><ul class="reasons">{reasons(r['reason'])}</ul>
-<div class="meta">{'In <code>' + esc(r['dest']) + '</code><br>' if Path(r['dest']).exists() else 'Deleted<br>'}
-{esc(when(r['ts']))} · {r['files']} files · {esc(size(r['size']))}</div></div>""" for r in items]
+        waiting = [r for r in items if self.waiting(r)]
+        done = [r for r in items if not self.waiting(r)]
+        cards = [self.quarantine_card(r) for r in waiting]
+        if not waiting:
+            cards.append("<div class='card empty'>Nothing waiting for a decision.</div>")
+        if done:
+            cards.append("<h1 style='margin-top:28px'>Handled</h1><p class='sub'>Earlier quarantine decisions.</p>")
+            cards += [self.quarantine_card(r) for r in done[:50]]
         return head + "".join(cards)
+
+    def quarantine_card(self, r: dict) -> str:
+        outcome = r.get("outcome")
+        if outcome == "allowed":
+            where = "Allowed and sorted<br>"
+        elif outcome == "discarded" or not self.waiting(r):
+            where = "Deleted<br>"
+        elif self.actions is not None and self.actions.quarantine_state(r) == "torrent":
+            where = f"Still in qBittorrent (stopped, tagged quarantine) at <code>{esc(r['dest'])}</code><br>"
+        else:
+            where = f"In <code>{esc(r['dest'])}</code><br>"
+        buttons = self.quarantine_decisions(r) if self.waiting(r) else ""
+        return f"""<div class="card {'bad' if self.waiting(r) else ''}"><h2>{esc(r['name'])}</h2>
+<ul class="reasons">{reasons(r['reason'])}</ul>
+<div class="meta">{where}{esc(when(r['ts']))} · {r['files']} files · {esc(size(r['size']))}</div>{buttons}</div>"""
+
+    def quarantine_decisions(self, r: dict) -> str:
+        if not self.can_act():
+            return ""
+        hidden = (f'<input type="hidden" name="csrf" value="{esc(self.csrf)}">'
+                  f'<input type="hidden" name="id" value="{r["id"]}">')
+        torrent = self.actions.quarantine_state(r) == "torrent"
+        virus = "virus found" in (r["reason"] or "")
+        if torrent:
+            allow_text = ("Links the audio into the library (or Needs review if Audible has no match), "
+                          "then starts the torrent seeding again.")
+            delete_text = (f"Permanently deletes this torrent's {r['files']} files ({esc(size(r['size']))}). "
+                           "The torrent stays in qBittorrent's list, stopped. This can't be undone.")
+        else:
+            allow_text = ("Moves the audio into the library (or Needs review if Audible has no match). "
+                          "Blocked extras left behind are deleted.")
+            delete_text = (f"Permanently deletes these {r['files']} files ({esc(size(r['size']))}) from the "
+                           "quarantine folder. This can't be undone.")
+        confirm = ('<label class="note" style="display:block;margin:0 0 10px">'
+                   '<input type="checkbox" required> ClamAV flagged this as a virus. I trust it anyway.</label>'
+                   if virus else "")
+        return ('<div class="actions">'
+                f'<details><summary class="danger">Delete files</summary><div class="panel"><p>{delete_text}</p>'
+                f'<form method="post" action="/review/action">{hidden}'
+                f'<button class="danger" name="do" value="discard">Delete files</button></form></div></details>'
+                f'<details><summary>Allow</summary><div class="panel"><p>{allow_text}</p>'
+                f'<form method="post" action="/review/action">{hidden}{confirm}'
+                f'<button class="primary" name="do" value="allow">Allow and sort</button></form></div></details>'
+                '</div>')
 
 
 def start(history, status: dict, cfg, actions=None) -> ThreadingHTTPServer:
