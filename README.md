@@ -148,14 +148,18 @@ It starts three containers:
 
 | Container | Port | Notes |
 |---|---|---|
-| `qbittorrent` | 8080 (Web UI), 6881 (torrents) | Saves to `/data/torrents`. |
+| `qbittorrent` | 8081 (Web UI; QTS already uses 8080), 6881 (torrents) | Saves to `/data/torrents`. |
 | `clamav` | none published | Updates its signatures by itself. The first start takes a few minutes while it downloads them; the sorter waits. |
 | `audiobook-sorter` | 8090 | Runs as the `media` user with a read-only filesystem and no extra privileges. |
+
+If creation fails with `address already in use`, another app on the NAS has that port.
+Change the left-hand number of that port in `docker-compose.yml` (e.g. `8082:8080`), delete
+the half-created application in Container Station, and create it again.
 
 If the sorter logs `Permission denied` writing to the library, give the `media` user
 read/write on the `Container` share (QTS → Shared Folders → Edit permissions).
 
-### 4. Set up qBittorrent (`http://QNAP-NV:8080`)
+### 4. Set up qBittorrent (`http://QNAP-NV:8081`)
 The first login password is in the container's log.
 
 - **Downloads**
@@ -175,12 +179,12 @@ The first login password is in the container's log.
     `172.30.50.0/24`. This lets the sorter in without storing a password. Alternatively,
     put the username/password in `config.toml`.
 - **Connection.** Untick UPnP. Forward only the torrent port (6881) on your router, never
-  8080 or 8090.
+  8081 or 8090.
 
 ### 5. Send magnets from Firefox (Torrent Control)
 Torrent Control → Options:
 - Client: **qBittorrent**.
-- Address: `http://QNAP-NV:8080`, or the NAS's Tailscale address when away from home.
+- Address: `http://QNAP-NV:8081`, or the NAS's Tailscale address when away from home.
 - Your qBittorrent username and password.
 - Category `audiobooks`. Turn on the context-menu / click-to-add options you like.
 

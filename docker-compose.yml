@@ -27,7 +27,9 @@ services:
       - /share/Container/qbittorrent:/config
       - /share/Container/torrents:/data/torrents
     ports:
-      - "8080:8080"          # Web UI: LAN / Tailscale only, never forward this on the router
+      # Web UI on NAS port 8081 (QTS itself uses 8080). Inside the network it stays 8080,
+      # which is what the sorter uses. LAN / Tailscale only, never forward this on the router.
+      - "8081:8080"
       - "6881:6881"
       - "6881:6881/udp"
     security_opt:
