@@ -131,7 +131,9 @@ for both Intel and ARM NASes. Once that run is green:
 1. Open your GitHub profile → **Packages** → `audiobook-sorter` → **Package settings**.
 2. Set **Change visibility** to **Public**, so the NAS can pull the image without a login.
 
-Each later push rebuilds the image. To update the NAS, re-pull it in Container Station.
+Each later push rebuilds the image. The `watchtower` container on the NAS checks for a new
+image every hour and recreates the sorter with it, so you don't need to re-pull by hand. See
+its log in Container Station to confirm an update happened.
 
 `config.toml`, logs and the history database are git-ignored. Paths and passwords never
 leave your machines.
@@ -167,6 +169,7 @@ It starts three containers:
 | `qbittorrent` | 8081 (Web UI; QTS already uses 8080), 6881 (torrents) | Saves to `/data/torrents`. |
 | `clamav` | none published | Updates its signatures by itself. The first start takes a few minutes while it downloads them; the sorter waits. |
 | `audiobook-sorter` | 8090 | Runs as the `media` user with a read-only filesystem and no extra privileges. |
+| `watchtower` | none | Updates the sorter (only containers labelled `com.centurylinklabs.watchtower.enable=true`) within an hour of a new image. It needs the Docker socket, which gives it full control of Docker; it publishes no ports. To stop auto-updates, delete this service. |
 
 If creation fails with `address already in use`, another app on the NAS has that port.
 Pick another port in `docker-compose.yml`, delete the half-created application in Container

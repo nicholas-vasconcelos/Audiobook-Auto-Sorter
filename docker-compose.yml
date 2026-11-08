@@ -69,6 +69,26 @@ services:
     depends_on: [qbittorrent, clamav]
     networks: [audiobooks]
     restart: unless-stopped
+    labels:
+      - com.centurylinklabs.watchtower.enable=true   # Watchtower keeps this one up to date
+
+  # Pulls the sorter's new image after each push to GitHub and recreates the container with the
+  # same settings. Only containers labelled above are touched (qBittorrent and ClamAV are not).
+  watchtower:
+    image: nickfedor/watchtower:latest   # maintained fork of containrrr/watchtower
+    container_name: watchtower
+    environment:
+      - TZ=Europe/London
+      - WATCHTOWER_LABEL_ENABLE=true     # only update containers that opt in with the label
+      - WATCHTOWER_POLL_INTERVAL=3600    # check once an hour
+      - WATCHTOWER_CLEANUP=true          # delete the old image afterwards
+    volumes:
+      # Needed to recreate containers. This gives Watchtower full control of Docker, so it
+      # publishes no ports and has nothing else mounted.
+      - /var/run/docker.sock:/var/run/docker.sock
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
 
 networks:
   audiobooks:
