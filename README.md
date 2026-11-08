@@ -172,7 +172,15 @@ made in File Station belong to your admin account, so it usually can't. Fix it o
    ```bash
    sudo chmod -R u+rwX,g+rX /share/Container/audiobook-sorter /share/Container/torrents /share/Container/audiobookshelf/audiobooks
    ```
-3. Restart the `audiobook-sorter` container.
+3. Let ClamAV read the downloads. It scans as uid 100 inside its container, and QTS's
+   folder ACLs refuse that user even when the permission bits allow everyone (the sorter's
+   log says `clamd could not scan: ... File path check failure: Permission denied`). Add
+   a read-only ACL entry, inherited by new downloads:
+   ```bash
+   sudo setfacl -R -m u:100:rX -m d:u:100:rX /share/Container/torrents
+   ```
+   Check: `docker exec -u clamav clamav ls /data/torrents/audiobooks` must list the files.
+4. Restart the `audiobook-sorter` container.
 
 Audiobookshelf only needs to read the library, so it keeps working.
 
