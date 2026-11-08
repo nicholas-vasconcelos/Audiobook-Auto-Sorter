@@ -1,0 +1,10 @@
+.git
+.github
+config.toml
+.env
+*.log
+*.log.*
+*.db
+*.db-*
+__pycache__
+*.pyc

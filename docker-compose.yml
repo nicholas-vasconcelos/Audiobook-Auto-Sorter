@@ -1,0 +1,75 @@
+# Audiobook pipeline for Container Station: qBittorrent -> ClamAV -> sorter -> Audiobookshelf.
+#
+# Before creating the application, replace:
+#   YOUR_GITHUB_USER    your GitHub user name, lower case
+#   1001 / 100          the UID / GID of the NAS 'media' user (README: "Run on QNAP")
+#
+# Folders (create them first, see README):
+#   /share/Container/torrents/{incomplete,audiobooks,inbox,review,quarantine}
+#   /share/Container/qbittorrent        qBittorrent settings
+#   /share/Container/clamav             virus signatures
+#   /share/Container/audiobook-sorter   config.toml, log, history database
+
+name: audiobooks
+
+services:
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    environment:
+      - PUID=1001
+      - PGID=100
+      - UMASK=022            # files readable by ClamAV and the sorter
+      - TZ=Europe/London
+      - WEBUI_PORT=8080
+      - TORRENTING_PORT=6881
+    volumes:
+      - /share/Container/qbittorrent:/config
+      - /share/Container/torrents:/data/torrents
+    ports:
+      - "8080:8080"          # Web UI: LAN / Tailscale only, never forward this on the router
+      - "6881:6881"
+      - "6881:6881/udp"
+    security_opt:
+      - no-new-privileges:true
+    networks: [audiobooks]
+    restart: unless-stopped
+
+  clamav:
+    image: clamav/clamav:stable
+    container_name: clamav
+    volumes:
+      - /share/Container/clamav:/var/lib/clamav
+      - /share/Container/torrents:/data/torrents:ro   # same path the sorter sends it; read-only
+    # No ports published: only the sorter talks to it, on the private network.
+    security_opt:
+      - no-new-privileges:true
+    networks: [audiobooks]
+    restart: unless-stopped
+
+  sorter:
+    image: ghcr.io/YOUR_GITHUB_USER/audiobook-sorter:latest
+    container_name: audiobook-sorter
+    user: "1001:100"
+    environment:
+      - TZ=Europe/London
+    volumes:
+      - /share/Container/audiobook-sorter:/config
+      # One mount holding both the downloads and the library, so hard links work.
+      - /share/Container:/data
+    ports:
+      - "8090:8090"          # sorter web UI: LAN / Tailscale only
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    depends_on: [qbittorrent, clamav]
+    networks: [audiobooks]
+    restart: unless-stopped
+
+networks:
+  audiobooks:
+    ipam:
+      config:
+        - subnet: 172.30.50.0/24   # fixed, so qBittorrent can let the sorter in without a password

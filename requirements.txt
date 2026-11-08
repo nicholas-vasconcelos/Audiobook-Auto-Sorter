@@ -1,0 +1,4 @@
+mutagen>=1.47
+watchdog>=4.0
+requests>=2.31
+rapidfuzz>=3.0

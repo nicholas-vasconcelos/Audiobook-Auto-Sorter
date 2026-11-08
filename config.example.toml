@@ -1,0 +1,63 @@
+# Audiobook sorter settings. Copy to config.toml and edit.
+# On the QNAP this file lives in /share/Container/audiobook-sorter/config.toml.
+# Paths: use 'single quotes' for Windows paths (backslashes kept as-is),
+# or forward slashes inside "double quotes".
+
+# Inbox for books you drop in by hand (and review items you've fixed). Books here are MOVED.
+source_dir  = "/data/torrents/inbox"
+
+# Your Audiobookshelf "audiobooks" library folder.
+library_dir = "/data/audiobookshelf/audiobooks"
+
+# Books with no confident Audible match. Empty = <source_dir>/_needs_review
+review_dir  = "/data/torrents/review"
+
+# Books blocked by the file-type filter or ClamAV. Empty = <source_dir>/_quarantine
+quarantine_dir = "/data/torrents/quarantine"
+
+# Audible store to check against: com, co.uk, de, fr, ca, com.au, it, es, in, co.jp
+audible_region = "com"
+
+# 0-100. How closely tags must match Audible (title AND author) to be accepted.
+match_threshold = 85
+
+# Seconds a book in source_dir must stay unchanged before it's moved.
+settle_seconds = 60
+
+audio_extensions = [".m4b", ".m4a", ".mp3", ".flac", ".ogg", ".opus", ".aac"]
+
+# true = only log what would happen
+dry_run = false
+
+
+# Finished torrents in this qBittorrent category are scanned, hard-linked into the library
+# (so they keep seeding) and removed once they reach qBittorrent's share limit.
+# Delete this section to only use source_dir.
+[qbittorrent]
+url = "http://qbittorrent:8080"
+# Leave username/password empty if qBittorrent lets the container subnet in without a login
+# (Options > Web UI > "Bypass authentication for clients in whitelisted IP subnets": 172.30.50.0/24).
+username = ""
+password = ""
+category = "audiobooks"
+delete_after_seeding = true
+# Only needed if qBittorrent sees the downloads under a different path than the sorter:
+# [qbittorrent.path_map]
+# "/downloads" = "/data/torrents"
+
+
+[scan]
+# Files allowed besides audio. Anything else (.exe, .zip, .lnk, ...) sends the whole torrent
+# to quarantine. Remove this line to use the built-in list.
+allowed_extensions = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".cue", ".nfo", ".txt",
+                      ".pdf", ".m3u", ".m3u8", ".sfv", ".md5", ".log"]
+# ClamAV daemon. Empty = file-type filter only.
+clamd_host = "clamav"
+clamd_port = 3310
+
+
+[web]
+enabled = true
+port = 8090
+# Optional login for the page (any user name). Or set the SORTER_UI_PASSWORD environment variable.
+password = ""
