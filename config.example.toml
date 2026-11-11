@@ -60,6 +60,7 @@ clamd_port = 3310
 # Files written into each book folder so Audiobookshelf shows Audible's details (README).
 write_opf = true          # metadata.opf: title, author, narrator, series, description, genres, ASIN
 download_cover = true     # Audible's cover as cover.jpg when the folder has no cover image
+write_chapters = true     # metadata.json with chapter timestamps, so you can skip chapters (README)
 asin_in_folder = false    # name folders "Title [ASIN]"
 
 [web]

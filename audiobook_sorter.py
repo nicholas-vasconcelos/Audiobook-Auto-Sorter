@@ -86,6 +86,7 @@ class ScanSettings:
 class MetadataSettings:
     write_opf: bool = True          # metadata.opf next to each book (Audiobookshelf prefers it to the tags)
     download_cover: bool = True     # Audible's cover as cover.jpg, unless the folder already has a cover
+    write_chapters: bool = True     # metadata.json with chapter timestamps, when Audnexus has them
     asin_in_folder: bool = False    # "Project Hail Mary [B08G9PRS1K]": lets Audiobookshelf match by ASIN
 
 
@@ -151,6 +152,7 @@ def load_config(path: Path) -> Config:
     md = raw.get("metadata", {})
     cfg.metadata = MetadataSettings(write_opf=bool(md.get("write_opf", True)),
                                     download_cover=bool(md.get("download_cover", True)),
+                                    write_chapters=bool(md.get("write_chapters", True)),
                                     asin_in_folder=bool(md.get("asin_in_folder", False)))
     if (w := raw.get("web")) is not None and w.get("enabled", True):
         cfg.web = WebSettings(host=w.get("host", "0.0.0.0"), port=int(w.get("port", 8090)),
@@ -795,15 +797,61 @@ def download_cover(p: dict, target: Path) -> bool:
     return True
 
 
+# Audible marketplace (audible_region) -> Audnexus region code (its chapter lookup mirrors them 1:1).
+AUDNEX_REGIONS = {"com": "us", "co.uk": "uk", "de": "de", "fr": "fr", "ca": "ca", "com.au": "au",
+                  "it": "it", "es": "es", "in": "in", "co.jp": "jp"}
+
+
+def audnexus_chapters(cfg: Config, asin: str) -> list[dict] | None:
+    """Chapter titles and timestamps (seconds) for an ASIN, from the free Audnexus API (audnex.us).
+
+    Best-effort: returns None on any problem, including the common case of no chapter data for this
+    book. This is the same source Audiobookshelf's own "Find Chapters" button on the Chapters tab uses.
+    """
+    region = AUDNEX_REGIONS.get(cfg.audible_region, "us")
+    try:
+        r = requests.get(f"https://api.audnex.us/books/{asin}/chapters", params={"region": region}, timeout=20)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        data = r.json()
+    except (requests.RequestException, ValueError) as e:
+        log.warning("Couldn't look up chapters for %s: %s", asin, e)
+        return None
+    out = []
+    for c in data.get("chapters") or []:
+        title = (c.get("title") or "").strip()
+        start_ms, length_ms = c.get("startOffsetMs"), c.get("lengthMs")
+        if not title or not isinstance(start_ms, (int, float)) or not isinstance(length_ms, (int, float)):
+            continue
+        out.append({"start": start_ms / 1000, "end": (start_ms + length_ms) / 1000, "title": title})
+    return out or None
+
+
+def write_book_chapters(cfg: Config, dest: Path, asin: str) -> None:
+    """metadata.json with Audnexus's chapters for this ASIN, so Audiobookshelf can skip between them on
+    its very first scan. Never overwrites a metadata.json that's already there (Audiobookshelf's own, or
+    one you edited by hand)."""
+    chapters = audnexus_chapters(cfg, asin)
+    if not chapters:
+        return
+    try:
+        tmp = dest / "metadata.json.sorting"
+        tmp.write_text(json.dumps({"chapters": chapters}, indent=2), encoding="utf-8")
+        os.replace(tmp, dest / "metadata.json")
+    except OSError as e:
+        log.warning("Couldn't write chapters for %s: %s", dest, e)
+
+
 def write_book_metadata(cfg: Config, dest: Path, m: Meta) -> None:
-    """Put metadata.opf (and Audible's cover) in the book folder, so Audiobookshelf shows the Audible
-    details instead of whatever the download's tags say. The audio files themselves are never changed:
-    for a torrent they're hard links to the files being seeded."""
+    """Put metadata.opf, Audible's cover, and a chapters file in the book folder, so Audiobookshelf shows
+    the Audible details (and skippable chapters) instead of whatever the download's tags say. The audio
+    files themselves are never changed: for a torrent they're hard links to the files being seeded."""
     md = cfg.metadata
-    if cfg.dry_run or not (md.write_opf or md.download_cover) or not dest.is_dir():
+    if cfg.dry_run or not (md.write_opf or md.download_cover or md.write_chapters) or not dest.is_dir():
         return
     p = m.product
-    if p is None and m.asin:
+    if p is None and m.asin and (md.write_opf or md.download_cover):
         try:
             p = audible_product(cfg, m.asin)
         except NetworkError as e:
@@ -817,16 +865,27 @@ def write_book_metadata(cfg: Config, dest: Path, m: Meta) -> None:
             download_cover(p, dest / "cover.jpg")
     except OSError as e:
         log.warning("Couldn't write metadata for %s: %s", dest, e)
+    if md.write_chapters and m.asin and not (dest / "metadata.json").exists():
+        write_book_chapters(cfg, dest, m.asin)
+
+
+def metadata_needed(cfg: Config, dest: Path) -> bool:
+    """Is there metadata this book's folder doesn't have yet (worth a backfill pass)?"""
+    md = cfg.metadata
+    return ((md.write_opf and not (dest / "metadata.opf").exists())
+            or (md.download_cover and not has_cover(dest))
+            or (md.write_chapters and not (dest / "metadata.json").exists()))
 
 
 def backfill_metadata(cfg: Config) -> None:
-    """--write-metadata: add metadata.opf / cover.jpg to books this sorter filed before it wrote them."""
+    """--write-metadata: add metadata.opf / cover.jpg / chapters to books sorted before this ran, or
+    before a setting was turned on."""
     if _history is None:
         sys.exit("--write-metadata needs the history database (a [web] or [qbittorrent] section).")
     done = skipped = 0
     for r in _history.sorted_books():
         dest = Path(r["dest"])
-        if not dest.is_dir() or (dest / "metadata.opf").exists():
+        if not dest.is_dir() or not metadata_needed(cfg, dest):
             skipped += 1
             continue
         match = ASIN_RE.search(r.get("reason") or "")
@@ -835,6 +894,8 @@ def backfill_metadata(cfg: Config) -> None:
         write_book_metadata(cfg, dest, m)
         log.info("METADATA %s", dest)
         done += 1
+        if cfg.metadata.write_chapters:  # be polite to the free Audnexus API on a big backfill
+            time.sleep(0.7)
     log.info("Wrote metadata for %d book(s); %d skipped (already done or folder gone)", done, skipped)
 
 

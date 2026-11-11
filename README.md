@@ -79,7 +79,7 @@ Otherwise the sorter copies the files and logs a warning.
    - correct the tags or rename the folder;
    - move it from the review folder into the inbox, and it is sorted again.
 
-## Ready for Audiobookshelf: metadata.opf and cover.jpg
+## Ready for Audiobookshelf: metadata.opf, cover.jpg and chapters
 Each book folder the sorter files also gets:
 
 - **`metadata.opf`** with Audible's details: title, subtitle, author(s), narrator(s), series
@@ -88,9 +88,11 @@ Each book folder the sorter files also gets:
   whatever the download was tagged with. No "Match" needed.
 - **`cover.jpg`**, Audible's cover (1024 px), unless the folder already has a `cover` or
   `folder` image.
+- **`metadata.json`** with chapter timestamps, so you can skip between chapters in
+  Audiobookshelf's player instead of getting one long track. See below.
 
 Books you file from the review page get them too. **Accept match** uses Audible's details;
-**Edit and sort** writes what you typed (no cover, since there's no Audible match).
+**Edit and sort** writes what you typed (no cover or chapters, since there's no Audible match).
 
 The audio files are never changed. For torrents they're hard links to the files being seeded,
 and editing them would break seeding.
@@ -101,10 +103,11 @@ Options, under `[metadata]` in `config.toml`:
 |---|---|---|
 | `write_opf` | `true` | Write `metadata.opf`. |
 | `download_cover` | `true` | Download Audible's cover when the folder has none. |
+| `write_chapters` | `true` | Write `metadata.json` with chapter timestamps, when available (below). |
 | `asin_in_folder` | `false` | Name folders `Title [B08G9PRS1K]`. Audiobookshelf reads an ASIN in brackets, which helps its own Match. |
 
-**Books sorted before this feature.** Add the files to books the sorter already filed (it uses
-the history database):
+**Books sorted before this feature, or before a setting above was turned on.** Add whatever's
+missing to books the sorter already filed (it uses the history database):
 ```bash
 docker exec audiobook-sorter python /app/audiobook_sorter.py --config /config/config.toml --write-metadata
 ```
@@ -112,7 +115,29 @@ Books that already show in Audiobookshelf may keep their old details: its own sa
 outranks the OPF. Use the book's **Match**, or remove and re-scan the book.
 
 **Audiobookshelf settings.** In the library's settings, keep **OPF** above **audio file tags**
-in the metadata order of precedence (it is by default).
+in the metadata order of precedence (it is by default). The **Audiobookshelf metadata file**
+source needs to stay turned on too (it can be lowest priority) — that's what lets Audiobookshelf
+read the `metadata.json` chapters below; it's on by default.
+
+### Why chapters were missing, and where they come from
+A book downloaded as one audio file (as opposed to one file per chapter) only gets skippable
+chapters in Audiobookshelf if that file has chapter markers embedded in it, or Audiobookshelf is
+told about them some other way. The sorter never edits the audio, so whatever chapter markers
+were (or weren't) baked into the file you downloaded are what you get — for a lot of releases,
+that's nothing.
+
+`metadata.json` fixes this without touching the audio: the sorter looks up the book's chapter
+titles and timestamps by ASIN at [Audnexus](https://api.audnex.us) (the same free, public source
+Audiobookshelf's own "Find Chapters" button uses) and writes them to that file. Audiobookshelf
+reads it on the very first scan, so a newly sorted book shows proper chapters without you
+touching it. Audnexus doesn't have every book, so some books still won't get any — nothing to
+do about that beyond the "Find Chapters" button in Audiobookshelf's own Edit screen.
+
+One catch if you later edit a book's chapters by hand or in bulk in Audiobookshelf and a chapter
+seems stuck: Audiobookshelf writes its own `metadata.json` back whenever you save, and a plain
+re-scan after that won't touch chapters again (it treats what's already saved as intentional).
+If you want Audiobookshelf to re-read the file's embedded chapters (or look them up fresh) after
+that, use **Remove All** on the book's Chapters tab, then re-scan.
 
 ---
 
