@@ -363,9 +363,10 @@ Windows paths in `config.toml` go in 'single quotes' (e.g. `'G:\Torrents\AUDIOBO
 - A book in the inbox is moved once it has stopped changing for `settle_seconds`.
   - On the same volume it is renamed (instant).
   - Otherwise it is copied, its size checked, and the original deleted.
-- **Leftover folders.** Once a folder has no audio left (only covers, .txt, .nfo …), it is
-  deleted. Folders the sorter didn't empty itself are only cleaned up after 10 minutes
-  without changes.
+- **Leftover folders.** Once a folder holds only leftovers (covers, `.txt`, `.nfo`, `.cue`,
+  playlists, checksums), it is deleted. A folder with anything else in it, such as an ebook, a
+  PDF or a file type the sorter doesn't know, is never deleted. Folders the sorter didn't empty
+  itself are only cleaned up after 10 minutes without changes.
 - **Retries.** If the NAS, Audible or ClamAV can't be reached, the book stays put and is
   retried later.
 - **Duplicates.** A book whose destination already has audio goes to review as a duplicate.

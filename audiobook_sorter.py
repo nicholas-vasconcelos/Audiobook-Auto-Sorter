@@ -930,11 +930,23 @@ def top_level_folder(cfg: Config, path: Path) -> Path | None:
     return top
 
 
-def cleanup_leftovers(cfg: Config, path: Path) -> None:
-    """Delete the source folder that held `path` once it has no audiobook files left.
+# What a download leaves behind once its audio is gone: safe to delete with the folder.
+# Anything else (an ebook, a PDF, a document, an unknown file) means the folder is kept.
+LEFTOVER_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".cue", ".nfo", ".txt",
+                 ".m3u", ".m3u8", ".sfv", ".md5", ".log"}
 
-    Covers, .txt, .nfo and other extras that no book claimed are deleted with it. Nothing is
-    deleted while any audio file or part-downloaded file remains anywhere inside the folder.
+
+def is_leftover(p: Path) -> bool:
+    name = p.name.lower()
+    return name in scanner.IGNORED_NAMES or name.startswith("._") or p.suffix.lower() in LEFTOVER_EXTS
+
+
+def cleanup_leftovers(cfg: Config, path: Path) -> None:
+    """Delete the source folder that held `path` once only leftovers remain in it.
+
+    Covers, .txt, .nfo and similar extras that no book claimed are deleted with it. Nothing is
+    deleted while the folder still holds anything else: audio, a part-downloaded file, an ebook,
+    a PDF or any file type not in LEFTOVER_EXTS.
     """
     top = top_level_folder(cfg, path)
     if top is None or top in _dry_cleaned:
@@ -943,7 +955,7 @@ def cleanup_leftovers(cfg: Config, path: Path) -> None:
         files = [p for p in top.rglob("*") if p.is_file() and p not in _dry_gone]
     except OSError:
         return
-    if any(p.suffix.lower() in cfg.audio_extensions or p.suffix.lower() in PARTIAL_SUFFIXES for p in files):
+    if not all(is_leftover(p) for p in files):
         return
     names = [p.relative_to(top).as_posix() for p in files]
     shown = ", ".join(names[:8]) + (f", +{len(names) - 8} more" if len(names) > 8 else "") or "empty"
@@ -971,7 +983,8 @@ LEFTOVER_MIN_AGE = 600  # a folder with only a cover in it might be a download j
 
 
 def leftover_folders(cfg: Config) -> list[Path]:
-    """Folders in source_dir with no audio that nobody has touched for a while (e.g. from an older run).
+    """Folders in source_dir holding only leftovers (covers, .nfo, ...) that nobody has touched for a
+    while, e.g. from an older run. A folder with an ebook, PDF or any other file is never listed.
 
     Folders this script empties itself are cleaned straight away; this is only for the others.
     """
@@ -983,8 +996,7 @@ def leftover_folders(cfg: Config) -> list[Path]:
             continue
         try:
             items = list(entry.rglob("*"))
-            if any(p.is_file() and (p.suffix.lower() in cfg.audio_extensions
-                                    or p.suffix.lower() in PARTIAL_SUFFIXES) for p in items):
+            if any(p.is_file() and not is_leftover(p) for p in items):
                 continue
             newest = max([entry.stat().st_mtime] + [p.stat().st_mtime for p in items])
         except OSError:
