@@ -58,7 +58,7 @@ box-shadow:0 1px 2px var(--shadow)}
 .card h2{font-size:16px;margin:0 0 6px;word-break:break-word;font-weight:600}
 .book-row{display:flex;gap:16px;align-items:flex-start}
 .book-row .book-body{flex:1;min-width:0}
-.book-row .thumb{flex:none;width:58px}
+.book-row .thumb{flex:none;width:72px}
 .reasons{margin:8px 0;padding:0;list-style:none}
 .reasons li{background:var(--warn-bg);border-radius:6px;padding:6px 10px;margin-bottom:4px;font-size:14px;
 word-break:break-word}
@@ -72,7 +72,7 @@ word-break:break-all}
 .book-card .thumb{width:100%;margin-bottom:9px}
 .book-card .t{font-size:14.5px;font-weight:600;line-height:1.3;word-break:break-word}
 .book-card .s{color:var(--muted);font-size:12.5px;word-break:break-word}
-.thumb{position:relative;aspect-ratio:2/3}
+.thumb{position:relative;aspect-ratio:1/1}   /* audiobook covers are square */
 .cover{display:block;width:100%;height:100%;border-radius:5px;object-fit:cover;
 box-shadow:0 8px 14px -8px var(--shadow),0 1px 0 rgba(255,255,255,.08) inset,
 0 0 0 1px rgba(0,0,0,.08);transition:transform .15s ease}
@@ -149,6 +149,54 @@ def find_cover(path: Path) -> Path | None:
     return None
 
 
+AUDIO_EXTS = (".m4b", ".m4a", ".mp3", ".flac", ".ogg", ".opus", ".aac")
+_embedded_cache: dict = {}   # audio path -> ((size, mtime), (bytes, mime) | None)
+
+
+def embedded_cover(path: Path) -> tuple[bytes, str] | None:
+    """The cover art stored inside the book's first audio file (most .m4b files have one)."""
+    folder = path if path.is_dir() else path.parent
+    try:
+        if path.is_file() and path.suffix.lower() in AUDIO_EXTS:
+            audio = path
+        else:
+            audio = min((f for f in folder.rglob("*") if f.is_file() and f.suffix.lower() in AUDIO_EXTS),
+                        key=lambda f: str(f).lower(), default=None)
+        if audio is None:
+            return None
+        st = audio.stat()
+    except OSError:
+        return None
+    key = (st.st_size, st.st_mtime)
+    hit = _embedded_cache.get(audio)
+    if hit and hit[0] == key:
+        return hit[1]
+    found = None
+    try:
+        import mutagen
+        from mutagen.id3 import ID3
+        from mutagen.mp4 import MP4, MP4Cover
+        f = mutagen.File(audio)
+        tags = getattr(f, "tags", None)
+        if isinstance(f, MP4) and tags is not None and tags.get("covr"):
+            c = tags["covr"][0]
+            found = (bytes(c), "image/png" if c.imageformat == MP4Cover.FORMAT_PNG else "image/jpeg")
+        elif isinstance(tags, ID3):
+            pics = tags.getall("APIC")
+            if pics:
+                found = (pics[0].data, pics[0].mime or "image/jpeg")
+        elif getattr(f, "pictures", None):
+            found = (f.pictures[0].data, f.pictures[0].mime or "image/jpeg")
+    except Exception as e:  # unreadable file: just no cover
+        log.debug("No embedded cover in %s: %s", audio, e)
+    if found and (not found[0] or found[1] not in IMAGE_EXTS.values() or len(found[0]) > 20_000_000):
+        found = None
+    if len(_embedded_cache) > 2000:
+        _embedded_cache.clear()
+    _embedded_cache[audio] = (key, found)
+    return found
+
+
 def spine_color(key: str) -> str:
     return SPINE_COLORS[zlib.crc32((key or "").encode("utf-8", "replace")) % len(SPINE_COLORS)]
 
@@ -159,11 +207,11 @@ def book_cover(title: str, cover_url: str | None) -> str:
         return f'<img class="cover" src="{esc(cover_url)}" alt="" loading="lazy">'
     title = (title or "?").strip()
     letter = esc((title[:1] or "?").upper())
-    return (f'<svg class="cover" viewBox="0 0 100 150" role="img" aria-label="{esc(title)}">'
-            f'<rect width="100" height="150" rx="5" fill="{spine_color(title)}"/>'
-            f'<rect x="7" y="7" width="86" height="136" rx="2" fill="none" '
+    return (f'<svg class="cover" viewBox="0 0 100 100" role="img" aria-label="{esc(title)}">'
+            f'<rect width="100" height="100" rx="5" fill="{spine_color(title)}"/>'
+            f'<rect x="7" y="7" width="86" height="86" rx="2" fill="none" '
             f'stroke="rgba(255,255,255,.32)" stroke-width="1.5"/>'
-            f'<text x="50" y="83" font-family="Georgia,serif" font-size="44" fill="rgba(255,255,255,.92)" '
+            f'<text x="50" y="55" font-family="Georgia,serif" font-size="44" fill="rgba(255,255,255,.92)" '
             f'text-anchor="middle" dominant-baseline="middle">{letter}</text></svg>')
 
 
@@ -230,7 +278,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; form-action 'self'")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -280,24 +328,27 @@ class Handler(BaseHTTPRequestHandler):
             return
         r = self.history.event(event_id) if self.history else None
         dest = Path(r["dest"]) if r and r.get("dest") else None
-        cover = None
+        cover, allowed = None, False
         if dest:
             try:
-                resolved = dest.resolve()
-                bases = (self.cfg.library_dir, self.cfg.review_dir, self.cfg.quarantine_dir)
-                if any(b is not None and b.resolve() in resolved.parents for b in bases) and dest.exists():
+                allowed = self.cover_allowed(dest)
+                if allowed:
                     cover = find_cover(dest)
             except OSError:
                 cover = None
-        if not cover:
+        data = ctype = None
+        if cover:
+            try:
+                data, ctype = cover.read_bytes(), IMAGE_EXTS.get(cover.suffix.lower(), "application/octet-stream")
+            except OSError:
+                data = None
+        elif dest and allowed:
+            found = embedded_cover(dest)
+            if found:
+                data, ctype = found
+        if not data:
             self.send(404, "Not found", "text/plain")
             return
-        try:
-            data = cover.read_bytes()
-        except OSError:
-            self.send(404, "Not found", "text/plain")
-            return
-        ctype = IMAGE_EXTS.get(cover.suffix.lower(), "application/octet-stream")
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
@@ -306,10 +357,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def cover_allowed(self, dest: Path) -> bool:
+        """Covers are only served from the library, review and quarantine folders."""
+        resolved = dest.resolve()
+        bases = (self.cfg.library_dir, self.cfg.review_dir, self.cfg.quarantine_dir)
+        return any(b is not None and b.resolve() in resolved.parents for b in bases) and dest.exists()
+
     def cover_thumb(self, r: dict) -> str:
         """A book's cover thumbnail for a review/quarantine/history card: real cover if there is one."""
         dest = Path(r["dest"]) if r.get("dest") else None
-        has_cover = bool(dest and dest.exists() and find_cover(dest))
+        try:
+            has_cover = bool(dest and self.cover_allowed(dest) and (find_cover(dest) or embedded_cover(dest)))
+        except OSError:
+            has_cover = False
         url = f"/cover?id={r['id']}" if has_cover else None
         title = r.get("title") or r.get("name") or ""
         return f'<div class="thumb">{book_cover(title, url)}</div>'
@@ -629,7 +689,10 @@ Big files take a while: keep this tab open until the page reloads. Your browser 
         else:
             badge, cls = "moved", ""
         dest = Path(r["dest"]) if r.get("dest") else None
-        has_cover = bool(dest and dest.exists() and find_cover(dest))
+        try:
+            has_cover = bool(dest and self.cover_allowed(dest) and (find_cover(dest) or embedded_cover(dest)))
+        except OSError:
+            has_cover = False
         url = f"/cover?id={r['id']}" if has_cover else None
         title = f'{esc(r["title"])}{(" — " + series) if series else ""} · from {esc(r["name"])} · {esc(r["dest"])}'
         return f"""<div class="book-card" title="{title}">
