@@ -10,9 +10,13 @@ import base64
 import hmac
 import html
 import logging
+import os
+import re
 import secrets
+import shutil
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
@@ -21,30 +25,40 @@ log = logging.getLogger("audiobook_sorter")
 PER_PAGE = 50
 MAX_FORM = 262_144   # the Allow form lists every file of a quarantined item
 
+# Warm, "reading room" palette: parchment and leather-brown rather than neutral grey.
 CSS = """
-:root{--bg:#f6f5f2;--card:#fff;--text:#1d1c1a;--muted:#6b6862;--line:#e3e0da;--accent:#2f6f5e;
---warn:#a5620b;--warn-bg:#fdf3e4;--bad:#b3261e;--bad-bg:#fbeceb;--ok:#2f6f5e;--chip:#efede8}
-@media (prefers-color-scheme:dark){:root{--bg:#161615;--card:#1f1f1d;--text:#ecebe7;--muted:#9c998f;
---line:#33322f;--accent:#6cc2a8;--warn:#e6a54a;--warn-bg:#2d2416;--bad:#f08a80;--bad-bg:#2e1b1a;
---ok:#6cc2a8;--chip:#2a2a27}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);
-font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
-header{background:var(--card);border-bottom:1px solid var(--line)}
-.wrap{max-width:1100px;margin:0 auto;padding:0 16px}
+:root{--bg:#f3ece0;--card:#fffdf8;--text:#2b2015;--muted:#7a6a55;--line:#e3d7c3;--accent:#3f6b52;
+--accent2:#8a5a35;--warn:#a5620b;--warn-bg:#fbeedb;--bad:#9c3b35;--bad-bg:#f8e6e1;--ok:#3f6b52;
+--chip:#ece2cf;--wood:#6b4a33;--shadow:rgba(60,38,18,.18)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#1b150f;--card:#241c14;
+--text:#eee2cf;--muted:#ab9a82;--line:#3a2e20;--accent:#7fb89a;--accent2:#d19a5f;--warn:#e6a54a;
+--warn-bg:#2f2314;--bad:#e2897f;--bad-bg:#30201c;--ok:#7fb89a;--chip:#2c2318;--wood:#3a2a1c;
+--shadow:rgba(0,0,0,.45)}}
+*{box-sizing:border-box}body{margin:0;background:
+radial-gradient(900px 500px at 15% -10%,rgba(138,90,53,.10),transparent),var(--bg);color:var(--text);
+font:15px/1.55 ui-sans-serif,system-ui,"Segoe UI",sans-serif}
+h1,h2,.brand,.t{font-family:Georgia,"Iowan Old Style","Palatino Linotype","Book Antiqua",serif}
+header{background:var(--card);border-bottom:1px solid var(--line);box-shadow:0 1px 0 var(--shadow)}
+.wrap{max-width:1180px;margin:0 auto;padding:0 16px}
 .top{display:flex;flex-wrap:wrap;align-items:center;gap:8px 24px;padding-top:14px;padding-bottom:14px}
-.brand{font-weight:650;font-size:17px}
+.brand{display:flex;align-items:center;gap:8px;font-weight:650;font-size:19px;letter-spacing:.01em}
+.brand svg{flex:none;color:var(--accent2)}
 nav{display:flex;gap:4px;flex-wrap:wrap}
-nav a{color:var(--muted);text-decoration:none;padding:6px 12px;border-radius:8px}
+nav a{color:var(--muted);text-decoration:none;padding:6px 12px;border-radius:8px;font-size:14.5px}
 nav a.on{background:var(--chip);color:var(--text);font-weight:600}
 nav .n{font-size:12px;margin-left:4px;color:var(--muted)}
 .status{display:flex;gap:16px;flex-wrap:wrap;margin-left:auto;font-size:13px;color:var(--muted)}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--muted)}
 .dot.ok{background:var(--ok)}.dot.bad{background:var(--bad)}
-main{padding:24px 0 48px}
-h1{font-size:20px;margin:0 0 4px}.sub{color:var(--muted);margin:0 0 20px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:12px}
+main{padding:28px 0 48px}
+h1{font-size:23px;margin:0 0 4px;font-weight:600}.sub{color:var(--muted);margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 18px;margin-bottom:14px;
+box-shadow:0 1px 2px var(--shadow)}
 .card.warn{border-left:4px solid var(--warn)}.card.bad{border-left:4px solid var(--bad)}
-.card h2{font-size:16px;margin:0 0 6px;word-break:break-word}
+.card h2{font-size:16px;margin:0 0 6px;word-break:break-word;font-weight:600}
+.book-row{display:flex;gap:16px;align-items:flex-start}
+.book-row .book-body{flex:1;min-width:0}
+.book-row .thumb{flex:none;width:58px}
 .reasons{margin:8px 0;padding:0;list-style:none}
 .reasons li{background:var(--warn-bg);border-radius:6px;padding:6px 10px;margin-bottom:4px;font-size:14px;
 word-break:break-word}
@@ -53,20 +67,29 @@ word-break:break-word}
 .meta b{color:var(--text);font-weight:550}
 code{font:12.5px ui-monospace,Consolas,monospace;background:var(--chip);padding:1px 5px;border-radius:4px;
 word-break:break-all}
-table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:12px;
-overflow:hidden}
-th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
-th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);font-weight:600}
-tr:last-child td{border-bottom:0}
-td .t{font-weight:550}td .s{color:var(--muted);font-size:13px}
+.shelf{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:22px 16px;margin-top:4px}
+.book-card{display:flex;flex-direction:column}
+.book-card .thumb{width:100%;margin-bottom:9px}
+.book-card .t{font-size:14.5px;font-weight:600;line-height:1.3;word-break:break-word}
+.book-card .s{color:var(--muted);font-size:12.5px;word-break:break-word}
+.thumb{position:relative;aspect-ratio:2/3}
+.cover{display:block;width:100%;height:100%;border-radius:5px;object-fit:cover;
+box-shadow:0 8px 14px -8px var(--shadow),0 1px 0 rgba(255,255,255,.08) inset,
+0 0 0 1px rgba(0,0,0,.08);transition:transform .15s ease}
+.book-card:hover .cover{transform:translateY(-3px) rotate(-.4deg)}
+.badge{position:absolute;left:4px;bottom:4px;font-size:10px;padding:2px 6px;border-radius:99px;
+background:rgba(20,14,8,.72);color:#f3ece0;white-space:nowrap}
+.badge.seed{background:var(--accent)}
+code{font:12.5px ui-monospace,Consolas,monospace;background:var(--chip);padding:1px 5px;border-radius:4px;
+word-break:break-all}
 .chip{display:inline-block;font-size:12px;padding:2px 8px;border-radius:99px;background:var(--chip);
 color:var(--muted);white-space:nowrap}.chip.seed{color:var(--accent)}
-form.search{display:flex;gap:8px;margin-bottom:16px}
+form.search{display:flex;gap:8px;margin-bottom:20px}
 form.search input{flex:1;min-width:0;padding:8px 12px;border:1px solid var(--line);border-radius:8px;
 background:var(--card);color:var(--text);font:inherit}
 form.search button,.pager a{padding:8px 14px;border:1px solid var(--line);border-radius:8px;
 background:var(--card);color:var(--text);font:inherit;text-decoration:none;cursor:pointer}
-.pager{display:flex;gap:8px;align-items:center;margin-top:16px;color:var(--muted)}
+.pager{display:flex;gap:8px;align-items:center;margin-top:20px;color:var(--muted)}
 .empty{color:var(--muted);text-align:center;padding:40px 16px}
 .actions{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start;margin-top:12px;padding-top:12px;
 border-top:1px solid var(--line)}
@@ -75,7 +98,7 @@ border-top:1px solid var(--line)}
 border-radius:8px;background:var(--card);color:var(--text);font:inherit;font-size:14px;cursor:pointer;
 list-style:none;line-height:1.4}
 .actions summary::-webkit-details-marker{display:none}
-.btn.primary,.actions button.primary{background:var(--accent);border-color:var(--accent);color:var(--card);
+.btn.primary,.actions button.primary{background:var(--accent);border-color:var(--accent);color:#fff;
 font-weight:600}
 .btn.danger,.actions button.danger,.actions summary.danger{color:var(--bad);border-color:var(--bad)}
 .actions details{flex-basis:auto}
@@ -98,8 +121,50 @@ border-radius:8px;background:var(--card)}
 .files label{display:flex;gap:8px;align-items:baseline;padding:3px 0;font-size:13.5px;word-break:break-all}
 .files label span{margin-left:auto;padding-left:12px;color:var(--muted);white-space:nowrap}
 .files label.blocked{color:var(--bad)}
-@media (max-width:700px){.hide-sm{display:none}.status{margin-left:0}}
+@media (max-width:700px){.hide-sm{display:none}.status{margin-left:0}
+.shelf{grid-template-columns:repeat(auto-fill,minmax(112px,1fr));gap:16px 12px}}
 """
+
+BOOK_ICON = ('<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+            'stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">'
+            '<path d="M3 5.5C3 4.4 3.9 4 5.5 4H11v15.5H5.5C3.9 19.5 3 19 3 18z"/>'
+            '<path d="M21 5.5C21 4.4 20.1 4 18.5 4H13v15.5h5.5c1.6 0 2.5-.5 2.5-1.5z"/></svg>')
+
+COVER_NAMES = ("cover", "folder")
+IMAGE_EXTS = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+
+# Warm, leathery spine colors for books with no cover image yet.
+SPINE_COLORS = ("#8a5a35", "#6b4a33", "#9c6b45", "#7a4b3c", "#55684f", "#79536a", "#4f6a74", "#8c6a3f")
+
+
+def find_cover(path: Path) -> Path | None:
+    """A cover/folder image next to (or inside) a book's files, same rule as the sorter's own."""
+    folder = path if path.is_dir() else path.parent
+    try:
+        for f in folder.iterdir():
+            if f.is_file() and f.stem.lower() in COVER_NAMES and f.suffix.lower() in IMAGE_EXTS:
+                return f
+    except OSError:
+        return None
+    return None
+
+
+def spine_color(key: str) -> str:
+    return SPINE_COLORS[zlib.crc32((key or "").encode("utf-8", "replace")) % len(SPINE_COLORS)]
+
+
+def book_cover(title: str, cover_url: str | None) -> str:
+    """A real cover <img>, or a plain warm 'spine' with the book's initial when there isn't one yet."""
+    if cover_url:
+        return f'<img class="cover" src="{esc(cover_url)}" alt="" loading="lazy">'
+    title = (title or "?").strip()
+    letter = esc((title[:1] or "?").upper())
+    return (f'<svg class="cover" viewBox="0 0 100 150" role="img" aria-label="{esc(title)}">'
+            f'<rect width="100" height="150" rx="5" fill="{spine_color(title)}"/>'
+            f'<rect x="7" y="7" width="86" height="136" rx="2" fill="none" '
+            f'stroke="rgba(255,255,255,.32)" stroke-width="1.5"/>'
+            f'<text x="50" y="83" font-family="Georgia,serif" font-size="44" fill="rgba(255,255,255,.92)" '
+            f'text-anchor="middle" dominant-baseline="middle">{letter}</text></svg>')
 
 
 def esc(v) -> str:
@@ -190,6 +255,11 @@ class Handler(BaseHTTPRequestHandler):
             elif url.path == "/quarantine":
                 msg = self.flash.pop(q.get("m", ""), None)
                 self.send(200, self.page("quarantine", self.quarantine_page(msg), refresh=not self.can_act()))
+            elif url.path == "/upload":
+                msg = self.flash.pop(q.get("m", ""), None)
+                self.send(200, self.page("upload", self.upload_page(msg), refresh=False))
+            elif url.path == "/cover":
+                self.cover_response(q.get("id", ""))
             else:
                 self.send(404, "Not found", "text/plain")
         except ValueError:
@@ -201,9 +271,56 @@ class Handler(BaseHTTPRequestHandler):
     def can_act(self) -> bool:
         return bool(self.password) and self.actions is not None
 
+    def cover_response(self, id_str: str) -> None:
+        """The book's cover image, looked up by history event id (never a raw path from the client)."""
+        try:
+            event_id = int(id_str)
+        except ValueError:
+            self.send(404, "Not found", "text/plain")
+            return
+        r = self.history.event(event_id) if self.history else None
+        dest = Path(r["dest"]) if r and r.get("dest") else None
+        cover = None
+        if dest:
+            try:
+                resolved = dest.resolve()
+                bases = (self.cfg.library_dir, self.cfg.review_dir, self.cfg.quarantine_dir)
+                if any(b is not None and b.resolve() in resolved.parents for b in bases) and dest.exists():
+                    cover = find_cover(dest)
+            except OSError:
+                cover = None
+        if not cover:
+            self.send(404, "Not found", "text/plain")
+            return
+        try:
+            data = cover.read_bytes()
+        except OSError:
+            self.send(404, "Not found", "text/plain")
+            return
+        ctype = IMAGE_EXTS.get(cover.suffix.lower(), "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "private, max-age=600")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def cover_thumb(self, r: dict) -> str:
+        """A book's cover thumbnail for a review/quarantine/history card: real cover if there is one."""
+        dest = Path(r["dest"]) if r.get("dest") else None
+        has_cover = bool(dest and dest.exists() and find_cover(dest))
+        url = f"/cover?id={r['id']}" if has_cover else None
+        title = r.get("title") or r.get("name") or ""
+        return f'<div class="thumb">{book_cover(title, url)}</div>'
+
     def do_POST(self):
         if not self.authorized():
+            self.close_connection = True
             self.send(401, "Login required", "text/plain", {"WWW-Authenticate": 'Basic realm="Audiobook sorter"'})
+            return
+        if urlparse(self.path).path == "/upload":
+            self.handle_upload()
             return
         if urlparse(self.path).path != "/review/action":
             self.send(404, "Not found", "text/plain")
@@ -262,6 +379,121 @@ class Handler(BaseHTTPRequestHandler):
         back = "/quarantine" if do in ("allow", "discard") else "/"
         self.send(303, "", "text/plain", {"Location": f"{back}?m={key}"})
 
+    # ------------------------------------------------------------------ upload
+    def upload_page(self, msg=None) -> str:
+        flash = f'<div class="flash {"ok" if msg[0] else "err"}">{esc(msg[1])}</div>' if msg else ""
+        head = ("<h1>Upload</h1><p class='sub'>Send an audiobook file from this computer to the sorter. "
+                "It goes into the inbox and is checked and sorted like any other book: file-type filter "
+                "and ClamAV, Audible match, then the library (or Needs review / Quarantine).</p>" + flash)
+        if not self.can_act():
+            return head + ("<div class='card empty'>Uploading needs a password: set <code>password</code> under "
+                           "<code>[web]</code> in config.toml and restart the sorter.</div>")
+        exts = ", ".join(self.cfg.audio_extensions)
+        return head + f"""<div class="card"><form method="post" action="/upload" enctype="multipart/form-data">
+<input type="hidden" name="csrf" value="{esc(self.csrf)}">
+<div class="fields"><label>Audiobook file ({esc(exts)})
+<input type="file" name="file" required accept="{esc(','.join(self.cfg.audio_extensions))}"></label></div>
+<p class="note">Name the file <b>Author - Title</b> (or tag it) if you can; it helps the Audible match.
+Big files take a while: keep this tab open until the page reloads. Your browser shows the progress.</p>
+<div class="actions"><button class="primary">Upload and sort</button></div></form></div>"""
+
+    def handle_upload(self) -> None:
+        """Stream a multipart upload straight to disk (never into memory), then drop it in the inbox."""
+        self.close_connection = True  # whatever happens, don't reuse a half-read connection
+
+        def done(ok: bool, text: str) -> None:
+            key = secrets.token_urlsafe(8)
+            if len(self.flash) > 50:
+                self.flash.clear()
+            self.flash[key] = (ok, text)
+            self.send(303, "", "text/plain", {"Location": f"/upload?m={key}"})
+
+        if not self.can_act():
+            self.send(403, "Uploading needs a password: set one under [web] in config.toml.", "text/plain")
+            return
+        origin = self.headers.get("Origin")
+        if origin and urlparse(origin).netloc.lower() != self.headers.get("Host", "").lower():
+            self.send(403, "Refused: request came from another site.", "text/plain")
+            return
+        m = re.search(r'boundary="?([^";]+)"?', self.headers.get("Content-Type", ""))
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if not m or not 0 < length <= MAX_UPLOAD:
+            self.send(400 if length <= MAX_UPLOAD else 413, "Bad or too large upload", "text/plain")
+            return
+        inbox = self.cfg.source_dir
+        try:
+            if shutil.disk_usage(inbox).free < length + 512 * 1024 ** 2:
+                self.send(507, "Not enough free space on the NAS for this upload.", "text/plain")
+                return
+        except OSError:
+            pass
+        tmp = inbox / f".upload-{secrets.token_hex(8)}.part"   # hidden + .part: the sorter ignores it
+        try:
+            name = self._receive(m.group(1).encode("latin-1"), length, tmp)
+        except UploadError as e:
+            tmp.unlink(missing_ok=True)
+            if e.status:
+                self.send(e.status, str(e), "text/plain")
+            else:
+                done(False, str(e))
+            return
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            log.exception("Upload failed")
+            done(False, "The upload failed; see audiobook_sorter.log.")
+            return
+        target = free_name(inbox / name)
+        try:
+            os.replace(tmp, target)
+        except OSError as e:
+            tmp.unlink(missing_ok=True)
+            done(False, f"Couldn't put the file in the inbox: {e}")
+            return
+        log.info("UPLOADED %s (%s) on the web page; it will be sorted shortly", target.name,
+                 size(target.stat().st_size))
+        done(True, f"Uploaded {target.name}. It will be sorted within about "
+                   f"{max(1, self.cfg.settle_seconds // 60 + 1)} minute(s): check the Sorted, Needs review "
+                   "and Quarantine tabs.")
+
+    def _receive(self, boundary: bytes, length: int, tmp: Path) -> str:
+        """Parse the multipart body: the csrf field must come first, then the file (written to tmp)."""
+        r = _Reader(self.rfile, length)
+        delim = b"--" + boundary
+        r.read_until(delim + b"\r\n", 4096)
+        csrf_ok = False
+        while True:
+            head = r.read_until(b"\r\n\r\n", 16384).decode("utf-8", "replace")
+            disp = re.search(r"(?im)^content-disposition:.*$", head)
+            disp = disp.group(0) if disp else ""
+            field_name = re.search(r'\bname="([^"]*)"', disp)
+            filename = re.search(r'\bfilename="([^"]*)"', disp)
+            if field_name and field_name.group(1) == "csrf" and not filename:
+                value = r.read_until(b"\r\n" + delim, 1024).decode("utf-8", "replace")
+                if not hmac.compare_digest(value, self.csrf):
+                    raise UploadError("Refused: the page was out of date. Reload it and try again.", 403)
+                csrf_ok = True
+            elif field_name and field_name.group(1) == "file" and filename:
+                if not csrf_ok:
+                    raise UploadError("Refused: the page was out of date. Reload it and try again.", 403)
+                name = clean_filename(filename.group(1))
+                if not name:
+                    raise UploadError("That file name can't be used. Rename the file and try again.")
+                if Path(name).suffix.lower() not in self.cfg.audio_extensions:
+                    raise UploadError(f"{name} isn't an audiobook file. Allowed: "
+                                      f"{', '.join(self.cfg.audio_extensions)}.")
+                with open(tmp, "wb") as f:
+                    written = r.stream_until(b"\r\n" + delim, f)
+                if written == 0:
+                    raise UploadError("The file was empty.")
+                return name
+            else:
+                r.read_until(b"\r\n" + delim, 1024)  # some other small field: skip it
+            if r.read_exact(2) == b"--":
+                raise UploadError("No file was chosen.")
+
     # ------------------------------------------------------------------ layout
     def page(self, active: str, body: str, refresh: bool = True) -> str:
         counts = self.history.counts()
@@ -269,12 +501,14 @@ class Handler(BaseHTTPRequestHandler):
         n_quarantine = sum(1 for r in self.history.quarantined() if self.waiting(r))
         tabs = [("review", "/", "Needs review", n_review), ("history", "/history", "Sorted", counts.get("sorted", 0)),
                 ("quarantine", "/quarantine", "Quarantine", n_quarantine)]
+        if self.can_act():
+            tabs.append(("upload", "/upload", "Upload", ""))
         nav = "".join(f'<a href="{href}" class="{"on" if key == active else ""}">{esc(text)}'
                       f'<span class="n">{n}</span></a>' for key, href, text, n in tabs)
         return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">{'<meta http-equiv="refresh" content="60">' if refresh else ''}
 <title>Audiobook Sorter</title><style>{CSS}</style></head><body>
-<header><div class="wrap top"><div class="brand">Audiobook Sorter</div><nav>{nav}</nav>
+<header><div class="wrap top"><div class="brand">{BOOK_ICON}Audiobook Sorter</div><nav>{nav}</nav>
 <div class="status">{self.status_bar()}</div></div></header>
 <main class="wrap">{body}</main></body></html>"""
 
@@ -315,10 +549,11 @@ class Handler(BaseHTTPRequestHandler):
             tagged = " · ".join(f"{k} <b>{esc(v)}</b>" for k, v in
                                 (("author", r["author"]), ("title", r["title"]), ("series", r["series"]),
                                  ("#", r["sequence"])) if v)
-            cards.append(f"""<div class="card warn"><h2>{esc(r['name'])}</h2>
+            cards.append(f"""<div class="card warn book-row">{self.cover_thumb(r)}<div class="book-body">
+<h2>{esc(r['name'])}</h2>
 <ul class="reasons">{reasons(r['reason'])}</ul>
 <div class="meta">{('Tags: ' + tagged + '<br>') if tagged else ''}In <code>{esc(r['dest'])}</code><br>
-{esc(when(r['ts']))} · {r['files']} files · {esc(size(r['size']))}</div>{self.decisions(r)}</div>""")
+{esc(when(r['ts']))} · {r['files']} files · {esc(size(r['size']))}</div>{self.decisions(r)}</div></div>""")
         note = ("" if self.can_act() or self.actions is None else
                 "<p class='note'>To decide here instead, set <code>password</code> under <code>[web]</code> "
                 "in config.toml and restart the sorter.</p>")
@@ -374,30 +609,33 @@ class Handler(BaseHTTPRequestHandler):
 
     def history_page(self, query: str, page: int) -> str:
         rows, total = self.history.history(query, page, PER_PAGE)
-        head = "<h1>Sorted</h1><p class='sub'>Books placed in the library, newest first.</p>"
+        head = "<h1>Sorted</h1><p class='sub'>Books on the shelf, newest first.</p>"
         form = (f'<form class="search" method="get" action="/history"><input name="q" value="{esc(query)}" '
                 f'placeholder="Search author, series or title" aria-label="Search"><button>Search</button></form>')
         if not rows:
             return head + form + f"<div class='card empty'>{'No matches.' if query else 'Nothing sorted yet.'}</div>"
-        trs = []
-        for r in rows:
-            series = f"{esc(r['series'])}{' #' + esc(r['sequence']) if r['sequence'] else ''}" if r["series"] else ""
-            if r["torrent_hash"]:
-                chip = ('<span class="chip">removed</span>' if r["removed_ts"]
-                        else '<span class="chip seed">seeding</span>')
-            else:
-                chip = '<span class="chip">moved</span>'
-            trs.append(f"""<tr><td><div class="t">{esc(r['title'])}</div><div class="s">{esc(r['author'])}</div>
-<div class="s">{series}</div></td>
-<td class="hide-sm"><code>{esc(r['dest'])}</code><div class="s">from {esc(r['name'])}</div></td>
-<td>{esc(when(r['ts']))}<div class="s">{esc(size(r['size']))}</div></td><td>{chip}</td></tr>""")
+        cards = "".join(self.book_card(r) for r in rows)
         pages = max(1, -(-total // PER_PAGE))
         qs = f"&q={quote(query)}" if query else ""
         prev = f'<a href="/history?page={page - 1}{qs}">Newer</a>' if page > 1 else ""
         nxt = f'<a href="/history?page={page + 1}{qs}">Older</a>' if page < pages else ""
         pager = f'<div class="pager">{prev}<span>Page {page} of {pages} · {total} books</span>{nxt}</div>'
-        return (head + form + "<table><thead><tr><th>Book</th><th class='hide-sm'>Library folder</th>"
-                "<th>Sorted</th><th></th></tr></thead><tbody>" + "".join(trs) + "</tbody></table>" + pager)
+        return head + form + f'<div class="shelf">{cards}</div>' + pager
+
+    def book_card(self, r: dict) -> str:
+        series = f"{esc(r['series'])}{' #' + esc(r['sequence']) if r['sequence'] else ''}" if r["series"] else ""
+        if r["torrent_hash"]:
+            badge, cls = ("removed", "") if r["removed_ts"] else ("seeding", " seed")
+        else:
+            badge, cls = "moved", ""
+        dest = Path(r["dest"]) if r.get("dest") else None
+        has_cover = bool(dest and dest.exists() and find_cover(dest))
+        url = f"/cover?id={r['id']}" if has_cover else None
+        title = f'{esc(r["title"])}{(" — " + series) if series else ""} · from {esc(r["name"])} · {esc(r["dest"])}'
+        return f"""<div class="book-card" title="{title}">
+<div class="thumb">{book_cover(r['title'], url)}<span class="badge{cls}">{badge}</span></div>
+<div class="t">{esc(r['title'])}</div><div class="s">{esc(r['author'])}</div>
+<div class="s">{series}</div><div class="s">{esc(when(r['ts']))}</div></div>"""
 
     @staticmethod
     def waiting(r: dict) -> bool:
@@ -437,9 +675,10 @@ class Handler(BaseHTTPRequestHandler):
         else:
             where = f"In <code>{esc(r['dest'])}</code><br>"
         buttons = self.quarantine_decisions(r) if self.waiting(r) else ""
-        return f"""<div class="card {'bad' if self.waiting(r) else ''}"><h2>{esc(r['name'])}</h2>
+        return f"""<div class="card {'bad' if self.waiting(r) else ''} book-row">{self.cover_thumb(r)}
+<div class="book-body"><h2>{esc(r['name'])}</h2>
 <ul class="reasons">{reasons(r['reason'])}</ul>
-<div class="meta">{where}{esc(when(r['ts']))} · {r['files']} files · {esc(size(r['size']))}</div>{buttons}</div>"""
+<div class="meta">{where}{esc(when(r['ts']))} · {r['files']} files · {esc(size(r['size']))}</div>{buttons}</div></div>"""
 
     def quarantine_decisions(self, r: dict) -> str:
         if not self.can_act():
@@ -469,6 +708,87 @@ class Handler(BaseHTTPRequestHandler):
                 f'<form method="post" action="/review/action">{hidden}{self.file_picker(r)}{confirm}'
                 f'<button class="primary" name="do" value="allow">Allow and sort</button></form></div></details>'
                 '</div>')
+
+
+MAX_UPLOAD = 20 * 1024 ** 3   # 20 GB: far beyond any single audiobook file
+CHUNK = 1024 * 1024
+
+
+class UploadError(Exception):
+    """A rejected upload. status set = refuse outright; None = show the message on the page."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+class _Reader:
+    """Reads a request body of known length in chunks, with a small look-ahead buffer."""
+
+    def __init__(self, raw, length: int):
+        self.raw, self.left, self.buf = raw, length, b""
+
+    def _fill(self) -> bool:
+        if self.left <= 0:
+            return False
+        data = self.raw.read(min(CHUNK, self.left))
+        if not data:
+            self.left = 0
+            return False
+        self.left -= len(data)
+        self.buf += data
+        return True
+
+    def read_until(self, marker: bytes, limit: int) -> bytes:
+        """Everything up to marker (marker consumed); limit caps what may come before it."""
+        while True:
+            i = self.buf.find(marker)
+            if i >= 0:
+                out, self.buf = self.buf[:i], self.buf[i + len(marker):]
+                return out
+            if len(self.buf) > limit + len(marker) or not self._fill():
+                raise UploadError("The upload was cut off or malformed. Try again.")
+
+    def stream_until(self, marker: bytes, f) -> int:
+        """Write everything up to marker to f; returns bytes written. Memory stays at about CHUNK."""
+        written = 0
+        while True:
+            i = self.buf.find(marker)
+            if i >= 0:
+                f.write(self.buf[:i])
+                self.buf = self.buf[i + len(marker):]
+                return written + i
+            keep = len(marker) - 1   # the marker may straddle two chunks
+            if len(self.buf) > keep:
+                f.write(self.buf[:-keep])
+                written += len(self.buf) - keep
+                self.buf = self.buf[-keep:]
+            if not self._fill():
+                raise UploadError("The upload was cut off before it finished. Try again.")
+
+    def read_exact(self, n: int) -> bytes:
+        while len(self.buf) < n:
+            if not self._fill():
+                raise UploadError("The upload was cut off or malformed. Try again.")
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+
+def clean_filename(name: str) -> str:
+    """A browser's file name made safe for the inbox: no folders, no special characters."""
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r'[<>:"|?*\x00-\x1f]', "", name)
+    name = re.sub(r"\s+", " ", name).strip().strip(".")
+    return name[:200] if name and not name.startswith(".") else ""
+
+
+def free_name(p: Path) -> Path:
+    i = 2
+    out = p
+    while out.exists():
+        out = p.with_name(f"{p.stem} ({i}){p.suffix}")
+        i += 1
+    return out
 
 
 def start(history, status: dict, cfg, actions=None) -> ThreadingHTTPServer:

@@ -166,6 +166,14 @@ Accepted and edited books move from the review folder into the library and show 
 Sorted page. A torrent keeps seeding from its download, and is removed at its seed limit as
 usual. If the destination already has audio, nothing moves and the page tells you why.
 
+### Uploading a book
+With a password set, the **Upload** tab sends an audiobook file (`.m4b`, `.mp3`, … any of
+`audio_extensions`) from your computer into the inbox. It is then handled exactly like a book
+you dropped there yourself: file-type filter and ClamAV, Audible match, then the library, Needs
+review or Quarantine. Name the file `Author - Title.m4b` (or tag it) to help the match. The file
+is streamed straight to disk, so large books are fine (up to 20 GB, and only if the NAS has room);
+keep the tab open until the page reloads. One file per upload.
+
 ### Deciding on quarantined items
 With a password set, each quarantined item waiting for you has two buttons:
 
